@@ -1,0 +1,1112 @@
+---
+title: "expression corr"
+author: "Rae G"
+date: "March 16, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(biomaRt)
+library(cowplot)
+library(knitr)
+library(qdapRegex)
+library(UpSetR)
+
+
+```
+
+##TCGA data
+
+```{r, read in and tidy TCGA psi and log2FC, warning = FALSE}
+## psi data from Matt, values are significant delta psis between healthy and tumorous tissue
+psis <- read.table("TCGApsis2.0.txt", header = TRUE) 
+psis_tidy <- as_tibble(psis) %>% 
+  mutate(sample = as.character(sample),
+         sample = substr(sample, 6, nchar(sample)-5),
+         sample = gsub("_", ".", sample),
+         psi = value,
+         GeneID = as.character(Gene),
+         GeneID = substr(GeneID, 1, nchar(GeneID)-3),
+         tumor = tumorID) %>% 
+  dplyr::select(tumor, sample, GeneID, psi)
+
+
+cancer_types <- psis %>% 
+    dplyr::select(tumorID) %>%
+    unique() %>% 
+    unlist() %>% 
+    as.character()  %>%
+    .[c(1:13, 15:20)] 
+
+## Get gene names from BiomaRt
+mart <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+gene_name <- getBM(attributes = c("ensembl_gene_id", "external_gene_name"),
+                   mart = mart) %>%
+  as_tibble() %>% 
+  mutate(GeneID = ensembl_gene_id,
+         Gene = external_gene_name) %>% 
+  dplyr::select(GeneID, Gene)
+
+
+## Expression data not significant, all expressed genes (above a threshold).
+x <- c(1:19)
+tumor_exp <- lapply(x, function(x) read.table(paste(paste("ExpressionTables2/", cancer_types[x], sep = ""), ".txt", sep = ""), header = TRUE))
+
+exp_tidy <- tumor_exp %>% 
+  Reduce(function(dtf1,dtf2) full_join(dtf1,dtf2,by="Gene"), .) %>% 
+  as_tibble() %>% 
+  gather(-Gene, key = sample, value = log2FC) %>% 
+  mutate(log2FC = as.numeric(log2FC), sample = substr(sample, 6, nchar(sample))) %>% 
+  na.omit() %>% 
+  left_join(., gene_name)
+
+
+## Different patients in psi and expression data, only want patients with both log2FC and psi data
+shared_samples <- left_join(exp_tidy, psis_tidy, by = c("GeneID", "sample")) %>% 
+  na.omit() %>% 
+  .$sample %>% 
+  unique() 
+
+
+## calculates median psi values for patients (global psi values) also replaces tumor types for expression data lacking psi values
+TCGA_psi_exp <- left_join(exp_tidy, psis_tidy, by = c("GeneID", "sample")) %>% 
+  filter(sample %in% shared_samples) %>% 
+  mutate(med_psi = psi) %>% 
+  group_by(sample) %>%
+  mutate_at(.vars = "med_psi", .funs = median, na.rm = TRUE) %>% 
+  mutate_at(.vars = "tumor", .funs = funs(ifelse(length(as.character(na.omit(unique(tumor)))) == 1, as.character(na.omit(unique(tumor))), NA))) %>% 
+  ungroup() 
+
+```
+
+```{r,  spearman functions, warning = FALSE}
+cor_eqn <- function(x, y){
+    m <- cor.test(x, y, method = "spearman");
+    
+    eq1 <- substitute(~~italic("rho")~"="~rho*",",
+         list(rho = format(as.numeric(m[4]), digits = 3)));
+    eq2 <- substitute(~~italic(p)~"="~pval,
+         list(pval = format(as.numeric(m[3]), digits = 3)));
+    
+   as.list(c(as.character(as.expression(eq1)), as.character(as.expression(eq2))));
+   } 
+
+facet_cor_eqn <- function(data, group, x, y){
+  i <- c(1:length(unique(group)))
+  p <- lapply(i, function(i) 
+      
+      p = as.double(unlist(data %>% 
+                           filter(group == sort(unique(group))[i]) %>% 
+                           dplyr::select(x))))
+  q <- lapply(i, function(i)
+      q = as.double(unlist(data %>% 
+                           filter(group == sort(unique(group))[i]) %>% 
+                           dplyr::select(y))))
+ 
+  label <- unlist(lapply(i, function(i)
+    cor_eqn(unlist(p[i]), unlist(q[i]))))
+  names(label) <- sort(rep(unique(group), 2))
+  unlist(label)
+}
+
+```
+
+```{r,  correlation analysis, warning = FALSE}
+
+## calculate correlations between psi and gene expression values for each gene (gene correlations) and between median psi values and gene expression values (global correlations)
+
+TCGA_gene_cor <- TCGA_psi_exp %>% 
+  dplyr::select(-med_psi) %>% 
+  na.omit() %>% 
+  group_by(GeneID) %>% 
+  summarize(n = n(),
+            cor = ifelse(n > 3, as.numeric(cor.test(psi, log2FC, method = "spearman")[4]), NA), 
+            pval = ifelse(n > 3, as.numeric(cor.test(psi, log2FC, method = "spearman")[3]), NA),
+            Gene = unique(Gene)) %>% 
+  na.omit()
+
+##Removing THCA to identify secondary driver of correlation
+TCGA_gene_cor_THCA <- TCGA_psi_exp %>% 
+  dplyr::select(-med_psi) %>%
+  filter(tumor != "THCA") %>% 
+  na.omit() %>% 
+  group_by(GeneID) %>% 
+  summarize(n = n(),
+            cor = ifelse(n > 3, as.numeric(cor.test(psi, log2FC, method = "spearman", exact = TRUE)[4]), NA), 
+            pval = ifelse(n > 3, as.numeric(cor.test(psi, log2FC, method = "spearman", exact = TRUE)[3]), NA),
+            Gene = unique(Gene)) %>% 
+  na.omit()
+
+TCGA_gene_cor_by_tumor <- TCGA_psi_exp %>%
+  dplyr::select(-med_psi) %>% 
+  na.omit() %>% 
+  group_by(GeneID, tumor) %>% 
+  summarize(n = n(), 
+            cor = ifelse(n > 3, as.numeric(cor.test(psi, log2FC, method = "spearman")[4]), NA), 
+            pval = ifelse(n > 3, as.numeric(cor.test(psi, log2FC, method = "spearman")[3]), NA),
+            Gene = unique(Gene)) %>%
+  na.omit()
+
+TCGA_gene_cor_THCA_by_tumor <- TCGA_psi_exp %>%
+  dplyr::select(-med_psi) %>% 
+  filter(tumor != "THCA") %>%
+  na.omit() %>% 
+  group_by(GeneID, tumor) %>% 
+  summarize(n = n(), 
+            cor = ifelse(n > 3, as.numeric(cor.test(psi, log2FC, method = "spearman")[4]), NA), 
+            pval = ifelse(n > 3, as.numeric(cor.test(psi, log2FC, method = "spearman")[3]), NA),
+            Gene = unique(Gene)) %>%
+  na.omit()
+
+TCGA_global_cor <- TCGA_psi_exp %>% 
+  group_by(GeneID) %>%
+  summarize(n = n(), 
+            cor = ifelse(n > 3, as.numeric(cor.test(med_psi, log2FC, method = "spearman")[4]), NA),
+            pval = ifelse(n > 3, as.numeric(cor.test(med_psi, log2FC, method = "spearman")[3]), NA),
+            Gene = unique(Gene)) %>%
+  na.omit()
+
+TCGA_global_cor_THCA <- TCGA_psi_exp %>% 
+  group_by(GeneID) %>%
+  filter(tumor != "THCA") %>% 
+  summarize(n = n(), 
+            cor = ifelse(n > 3, as.numeric(cor.test(med_psi, log2FC, method = "spearman")[4]), NA),
+            pval = ifelse(n > 3, as.numeric(cor.test(med_psi, log2FC, method = "spearman")[3]), NA),
+            Gene = unique(Gene)) %>%
+  na.omit()
+
+TCGA_global_cor_by_tumor <- TCGA_psi_exp %>% 
+  group_by(GeneID, tumor) %>%
+  summarize(n = n(),
+            cor = ifelse(n > 3, as.numeric(cor.test(med_psi, log2FC, method = "spearman")[4]), NA),
+            pval = ifelse(n > 3, as.numeric(cor.test(med_psi, log2FC, method = "spearman")[3]), NA),
+            Gene = unique(Gene)) %>% 
+  na.omit()
+
+TCGA_global_cor_THCA_by_tumor <- TCGA_psi_exp %>% 
+  group_by(GeneID, tumor) %>%
+  filter(tumor != "THCA") %>% 
+  summarize(n = n(),
+            cor = ifelse(n > 3, as.numeric(cor.test(med_psi, log2FC, method = "spearman")[4]), NA),
+            pval = ifelse(n > 3, as.numeric(cor.test(med_psi, log2FC, method = "spearman")[3]), NA),
+            Gene = unique(Gene)) %>% 
+  na.omit()
+
+```
+
+```{r, plotting the top 10 most correlated, warning = FALSE, fig.width = 20}
+## filter by a sample size of 50 and top 10 most correlated (abs(cor))
+
+gene_cor_10genes <- TCGA_gene_cor %>%
+  filter(n > 50) %>% 
+  arrange(desc(abs(cor))) %>%
+  top_n(10, wt = abs(cor))
+
+## Same but without THCA
+gene_cor_THCA_10genes <- TCGA_gene_cor_THCA %>%
+  filter(n > 50) %>%
+  arrange(desc(abs(cor))) %>%
+  top_n(10, wt = abs(cor))
+
+gene_cor_10genes_by_tumor <- TCGA_gene_cor_by_tumor %>% 
+  ungroup() %>% filter(n > 50) %>% 
+  arrange(desc(abs(cor))) %>%
+  top_n(10, wt = abs(cor)) %>% 
+  unite(tumor, Gene, col = select, sep = "-")
+
+gene_cor_THCA_10genes_by_tumor <- TCGA_gene_cor_THCA_by_tumor %>% 
+  ungroup() %>% filter(n > 50) %>% 
+  arrange(desc(abs(cor))) %>%
+  top_n(10, wt = abs(cor)) %>% 
+  unite(tumor, Gene, col = select, sep = "-")
+
+global_cor_10genes <- TCGA_global_cor %>%
+  filter(n > 50) %>% 
+  arrange(desc(abs(cor))) %>% 
+  top_n(10, wt = abs(cor))
+
+global_cor_THCA_10genes <- TCGA_global_cor_THCA %>%
+  filter(n > 50) %>% 
+  arrange(desc(abs(cor))) %>% 
+  top_n(10, wt = abs(cor))
+
+global_cor_10genes_by_tumor <- TCGA_global_cor_by_tumor %>%
+  ungroup() %>%
+  filter(n > 50) %>%
+  arrange(desc(abs(cor))) %>% 
+  top_n(10, wt = abs(cor)) %>% 
+  unite(tumor, Gene, col = select, sep = "-")
+
+global_cor_THCA_10genes_by_tumor <- TCGA_global_cor_THCA_by_tumor %>%
+  ungroup() %>%
+  filter(n > 50) %>%
+  arrange(desc(abs(cor))) %>% 
+  top_n(10, wt = abs(cor)) %>% 
+  unite(tumor, Gene, col = select, sep = "-")
+
+## plot it up
+
+label <- facet_cor_eqn(TCGA_psi_exp %>% filter(Gene %in% gene_cor_10genes$Gene) %>% mutate(group = Gene), 
+                       TCGA_psi_exp %>% filter(Gene %in% gene_cor_10genes$Gene) %>% .$Gene %>% unique(), 
+                       "psi",
+                       "log2FC")
+TCGA_psi_exp %>% 
+  filter(Gene %in% gene_cor_10genes$Gene) %>% 
+  ggplot(aes(psi, log2FC, col = tumor)) + 
+  geom_point() + 
+  geom_smooth(aes(psi, log2FC), method = lm, se = FALSE, inherit.aes = FALSE) +
+  facet_grid(.~factor(Gene, levels = gene_cor_10genes$Gene), scales = "free_x") +
+  geom_text(aes(x, y, label = Rho), 
+            parse = TRUE, 
+            data = data.frame(x = 0, 
+                              y = 3, 
+                              Rho = unlist(label)[seq(1, length(label), 2)], 
+                              Gene = names(label[seq(1, length(label), 2)]),
+                              tumor = NA)) + 
+  geom_text(aes(x, y, label = pval), 
+            parse = TRUE, 
+            data = data.frame(x = 0,
+                              y = 2.5, 
+                              pval = unlist(label)[seq(2, length(label), 2)], 
+                              Gene = names(label[seq(2, length(label), 2)]),
+                              tumor = NA)) +
+  geom_text(aes(x,y,label = n),
+            parse = TRUE,
+            data = data.frame(x = 0,
+                              y = 2.0,
+                              n = gene_cor_10genes$n,
+                              Gene = gene_cor_10genes$Gene,
+                              tumor = NA)) +
+  labs(title = "TCGA gene correlations") + theme_cowplot()
+##In the above pot, each dot is a patient where the Gene has both it's expression and psi values plotted.
+
+
+## What if we remove THCA? what is the seconday driver of correlation?
+label <- facet_cor_eqn(TCGA_psi_exp %>% filter(Gene %in% gene_cor_THCA_10genes$Gene) %>% mutate(group = Gene), 
+                       TCGA_psi_exp %>% filter(Gene %in% gene_cor_THCA_10genes$Gene) %>% .$Gene %>% unique(), 
+                       "psi",
+                       "log2FC")
+TCGA_psi_exp %>% 
+  filter(Gene %in% gene_cor_THCA_10genes$Gene) %>% 
+  ggplot(aes(psi, log2FC, col = tumor)) + 
+  geom_point() + 
+  geom_smooth(aes(psi, log2FC), method = lm, se = FALSE, inherit.aes = FALSE) +
+  facet_grid(.~factor(Gene, levels = gene_cor_THCA_10genes$Gene), scales = "free_x") +
+  geom_text(aes(x, y, label = Rho), 
+            parse = TRUE, 
+            data = data.frame(x = 0, 
+                              y = 3, 
+                              Rho = unlist(label)[seq(1, length(label), 2)], 
+                              Gene = names(label[seq(1, length(label), 2)]),
+                              tumor = NA)) + 
+  geom_text(aes(x, y, label = pval), 
+            parse = TRUE, 
+            data = data.frame(x = 0,
+                              y = 2.5, 
+                              pval = unlist(label)[seq(2, length(label), 2)], 
+                              Gene = names(label[seq(2, length(label), 2)]),
+                              tumor = NA)) +
+  geom_text(aes(x,y,label = n),
+            parse = TRUE,
+            data = data.frame(x = 0,
+                              y = 2.0,
+                              n = gene_cor_THCA_10genes$n,
+                              Gene = gene_cor_THCA_10genes$Gene,
+                              tumor = NA)) +
+  labs(title = "TCGA gene correlations without THCA") + theme_cowplot()
+
+label <- facet_cor_eqn(TCGA_psi_exp %>% unite(tumor, Gene, col = select, sep = "-") %>% filter(select %in% gene_cor_10genes_by_tumor$select) %>% mutate(group = select),
+                       TCGA_psi_exp %>% unite(tumor, Gene, col = select, sep = "-") %>% filter(select %in% gene_cor_10genes_by_tumor$select) %>% .$select %>% unique(),
+                       "psi",
+                       "log2FC")
+TCGA_psi_exp %>% 
+  unite(tumor, Gene, col = select, sep = "-") %>% 
+  filter(select %in% gene_cor_10genes_by_tumor$select) %>%
+  ggplot(aes(psi, log2FC)) + 
+  geom_point() + 
+  geom_smooth(method = lm, se = FALSE) + 
+  facet_grid(.~factor(select, levels = gene_cor_10genes_by_tumor$select), scales = "free_x") + 
+  geom_text(aes(x, y, label = Rho), 
+            parse = TRUE, 
+            data = data.frame(x = 0, 
+                              y = 3, 
+                              Rho = unlist(label)[seq(1, length(label), 2)], 
+                              select = names(label[seq(1, length(label), 2)]))) + 
+  geom_text(aes(x, y, label = pval),
+            parse = TRUE, 
+            data = data.frame(x = 0,
+                              y = 2.5, 
+                              pval = unlist(label)[seq(2, length(label), 2)], 
+                              select = names(label[seq(2, length(label), 2)]))) +
+  geom_text(aes(x,y,label = n),
+            parse = TRUE,
+            data = data.frame(x = 0,
+                              y = 2.0,
+                              n = gene_cor_10genes_by_tumor$n,
+                              select = gene_cor_10genes_by_tumor$select)) +
+  labs(title = "TCGA gene correlations by tumor") + theme_cowplot()
+
+
+label <- facet_cor_eqn(TCGA_psi_exp %>% unite(tumor, Gene, col = select, sep = "-") %>% filter(select %in% gene_cor_THCA_10genes_by_tumor$select) %>% mutate(group = select),
+                       TCGA_psi_exp %>% unite(tumor, Gene, col = select, sep = "-") %>% filter(select %in% gene_cor_THCA_10genes_by_tumor$select) %>% .$select %>% unique(),
+                       "psi",
+                       "log2FC")
+TCGA_psi_exp %>% 
+  unite(tumor, Gene, col = select, sep = "-") %>% 
+  filter(select %in% gene_cor_THCA_10genes_by_tumor$select) %>%
+  ggplot(aes(psi, log2FC)) + 
+  geom_point() + 
+  geom_smooth(method = lm, se = FALSE) + 
+  facet_grid(.~factor(select, levels = gene_cor_THCA_10genes_by_tumor$select), scales = "free_x") + 
+  geom_text(aes(x, y, label = Rho), 
+            parse = TRUE, 
+            data = data.frame(x = 0, 
+                              y = 3, 
+                              Rho = unlist(label)[seq(1, length(label), 2)], 
+                              select = names(label[seq(1, length(label), 2)]))) + 
+  geom_text(aes(x, y, label = pval),
+            parse = TRUE, 
+            data = data.frame(x = 0,
+                              y = 2.5, 
+                              pval = unlist(label)[seq(2, length(label), 2)], 
+                              select = names(label[seq(2, length(label), 2)]))) +
+  geom_text(aes(x,y,label = n),
+            parse = TRUE,
+            data = data.frame(x = 0,
+                              y = 2.0,
+                              n = gene_cor_10genes_by_tumor$n,
+                              select = gene_cor_THCA_10genes_by_tumor$select)) +
+  labs(title = "TCGA gene correlations by tumor without THCA") + theme_cowplot()
+
+
+label <- facet_cor_eqn(TCGA_psi_exp %>% filter(Gene %in% global_cor_10genes$Gene) %>% mutate(group = Gene),
+                       TCGA_psi_exp %>% filter(Gene %in% global_cor_10genes$Gene) %>% .$Gene %>% unique(),
+                       "med_psi",
+                       "log2FC")
+TCGA_psi_exp %>%
+  filter(Gene %in% global_cor_10genes$Gene) %>%
+  ggplot(aes(med_psi, log2FC, col = tumor)) +
+  geom_point()  +
+  geom_smooth(aes(med_psi, log2FC), method = lm, se = FALSE, inherit.aes = FALSE) +
+  facet_grid(.~factor(Gene, levels = global_cor_10genes$Gene), scales = "free_x") + 
+  geom_text(aes(x, y, label = Rho),
+            parse = TRUE,
+            data = data.frame(x = 0,
+                              y = 3, 
+                              Rho = unlist(label)[seq(1, length(label), 2)], 
+                              Gene = names(label[seq(1, length(label), 2)]),
+                              tumor = NA)) + 
+  geom_text(aes(x, y, label = pval),
+            parse = TRUE,
+            data = data.frame(x = 0,
+                              y = 2.5, 
+                              pval = unlist(label)[seq(2, length(label), 2)],
+                              Gene = names(label[seq(2, length(label), 2)]),
+                              tumor = NA)) +
+  geom_text(aes(x,y,label = n),
+            parse = TRUE,
+            data = data.frame(x = 0,
+                              y = 2.0,
+                              n = global_cor_10genes$n,
+                              Gene = global_cor_10genes$Gene,
+                              tumor = NA)) +
+  labs(title = "TCGA global correlations") + theme_cowplot()
+
+label <- facet_cor_eqn(TCGA_psi_exp %>% filter(Gene %in% global_cor_THCA_10genes$Gene) %>% mutate(group = Gene),
+                       TCGA_psi_exp %>% filter(Gene %in% global_cor_THCA_10genes$Gene) %>% .$Gene %>% unique(),
+                       "med_psi",
+                       "log2FC")
+TCGA_psi_exp %>%
+  filter(Gene %in% global_cor_THCA_10genes$Gene) %>%
+  ggplot(aes(med_psi, log2FC, col = tumor)) +
+  geom_point()  +
+  geom_smooth(aes(med_psi, log2FC), method = lm, se = FALSE, inherit.aes = FALSE) +
+  facet_grid(.~factor(Gene, levels = global_cor_THCA_10genes$Gene), scales = "free_x") + 
+  geom_text(aes(x, y, label = Rho),
+            parse = TRUE,
+            data = data.frame(x = 0,
+                              y = 3, 
+                              Rho = unlist(label)[seq(1, length(label), 2)], 
+                              Gene = names(label[seq(1, length(label), 2)]),
+                              tumor = NA)) + 
+  geom_text(aes(x, y, label = pval),
+            parse = TRUE,
+            data = data.frame(x = 0,
+                              y = 2.5, 
+                              pval = unlist(label)[seq(2, length(label), 2)],
+                              Gene = names(label[seq(2, length(label), 2)]),
+                              tumor = NA)) +
+  geom_text(aes(x,y,label = n),
+            parse = TRUE,
+            data = data.frame(x = 0,
+                              y = 2.0,
+                              n = global_cor_10genes$n,
+                              Gene = global_cor_THCA_10genes$Gene,
+                              tumor = NA)) +
+  labs(title = "TCGA global correlations without THCA") + theme_cowplot()
+
+label <- facet_cor_eqn(TCGA_psi_exp %>% unite(tumor, Gene, col = select, sep = "-") %>% filter(select %in% global_cor_10genes_by_tumor$select) %>% mutate(group = select),
+                       TCGA_psi_exp %>% unite(tumor, Gene, col = select, sep = "-") %>% filter(select %in% global_cor_10genes_by_tumor$select) %>% .$select %>% unique(),
+                       "med_psi",
+                       "log2FC")
+TCGA_psi_exp %>% 
+  unite(tumor, Gene, col = select, sep = "-") %>% 
+  filter(select %in% global_cor_10genes_by_tumor$select) %>%
+  ggplot(aes(med_psi, log2FC)) +
+  geom_point() + 
+  geom_smooth(method = lm, se = FALSE) + 
+  facet_grid(.~factor(select, levels = global_cor_10genes_by_tumor$select), scales = "free_x") +
+  geom_text(aes(x, y, label = Rho), 
+            parse = TRUE, 
+            data = data.frame(x = 0,
+                              y = 3, 
+                              Rho = unlist(label)[seq(1, length(label), 2)], 
+                              select = names(label[seq(1, length(label), 2)]))) +
+  geom_text(aes(x, y, label = pval), 
+            parse = TRUE, 
+            data = data.frame(x = 0,
+                              y = 2.5,
+                              pval = unlist(label)[seq(2, length(label), 2)], 
+                              select = names(label[seq(2, length(label), 2)]))) +
+  geom_text(aes(x,y,label = n),
+            parse = TRUE,
+            data = data.frame(x = 0,
+                              y = 2.0,
+                              n = global_cor_10genes_by_tumor$n,
+                              select = global_cor_10genes_by_tumor$select)) +
+  labs(title = "TCGA global correlations by tumor") + theme_cowplot()
+
+##In the above plot, each dot is a patient where their median psi value (for all genes) is plotted against a gene's expression. 
+
+label <- facet_cor_eqn(TCGA_psi_exp %>% unite(tumor, Gene, col = select, sep = "-") %>% filter(select %in% global_cor_THCA_10genes_by_tumor$select) %>% mutate(group = select),
+                       TCGA_psi_exp %>% unite(tumor, Gene, col = select, sep = "-") %>% filter(select %in% global_cor_THCA_10genes_by_tumor$select) %>% .$select %>% unique(),
+                       "med_psi",
+                       "log2FC")
+TCGA_psi_exp %>% 
+  unite(tumor, Gene, col = select, sep = "-") %>% 
+  filter(select %in% global_cor_THCA_10genes_by_tumor$select) %>%
+  ggplot(aes(med_psi, log2FC)) +
+  geom_point() + 
+  geom_smooth(method = lm, se = FALSE) + 
+  facet_grid(.~factor(select, levels = global_cor_THCA_10genes_by_tumor$select), scales = "free_x") +
+  geom_text(aes(x, y, label = Rho), 
+            parse = TRUE, 
+            data = data.frame(x = 0,
+                              y = 3, 
+                              Rho = unlist(label)[seq(1, length(label), 2)], 
+                              select = names(label[seq(1, length(label), 2)]))) +
+  geom_text(aes(x, y, label = pval), 
+            parse = TRUE, 
+            data = data.frame(x = 0,
+                              y = 2.5,
+                              pval = unlist(label)[seq(2, length(label), 2)], 
+                              select = names(label[seq(2, length(label), 2)]))) +
+  geom_text(aes(x,y,label = n),
+            parse = TRUE,
+            data = data.frame(x = 0,
+                              y = 2.0,
+                              n = global_cor_THCA_10genes_by_tumor$n,
+                              select = global_cor_THCA_10genes_by_tumor$select)) +
+  labs(title = "TCGA global correlations by tumor without THCA") + theme_cowplot()
+
+
+```
+
+```{r, what are these genes?, warning = FALSE, fig.width = 20}
+##get gene info
+TCGA_gene_cor_info <- getBM(attributes = c("ensembl_gene_id", "external_gene_name", "description", "name_1006"),
+                   filter = "ensembl_gene_id",
+                   values = gene_cor_10genes %>% .$GeneID,
+                   mart = mart) %>%
+  as_tibble() %>% 
+  group_by(ensembl_gene_id) %>% 
+  summarize(Gene = unique(external_gene_name), 
+            description = unique(rm_between(description, "[", "]")), 
+            GO = paste(name_1006, collapse = ", "))
+
+TCGA_gene_cor_THCA_info <- getBM(attributes = c("ensembl_gene_id", "external_gene_name", "description", "name_1006"),
+                   filter = "ensembl_gene_id",
+                   values = gene_cor_THCA_10genes %>% .$GeneID,
+                   mart = mart) %>%
+  as_tibble() %>% 
+  group_by(ensembl_gene_id) %>% 
+  summarize(Gene = unique(external_gene_name), 
+            description = unique(rm_between(description, "[", "]")), 
+            GO = paste(name_1006, collapse = ", "))
+
+TCGA_gene_cor_by_tumor_info <- getBM(attributes = c("ensembl_gene_id", "external_gene_name", "description", "name_1006"),
+                   filter = "ensembl_gene_id",
+                   values = gene_cor_10genes_by_tumor %>% .$GeneID,
+                   mart = mart) %>% 
+  as_tibble() %>% 
+  group_by(ensembl_gene_id) %>% 
+  summarize(Gene = unique(external_gene_name),
+            description = unique(rm_between(description, "[", "]")), 
+            GO = paste(name_1006, collapse = ", ")) %>% 
+  mutate(tumor = substr(gene_cor_10genes_by_tumor$select, 1, 4)) %>% 
+  dplyr::select(Gene, tumor, description, GO)
+
+TCGA_gene_cor_THCA_by_tumor_info <- getBM(attributes = c("ensembl_gene_id", "external_gene_name", "description", "name_1006"),
+                   filter = "ensembl_gene_id",
+                   values = gene_cor_THCA_10genes_by_tumor %>% .$GeneID,
+                   mart = mart) %>% 
+  as_tibble() %>%
+  group_by(ensembl_gene_id) %>% 
+  summarize(Gene = unique(external_gene_name),
+            description = unique(rm_between(description, "[", "]")), 
+            GO = paste(name_1006, collapse = ", ")) %>% left_join(gene_cor_THCA_10genes_by_tumor, by = c("ensembl_gene_id" = "GeneID")) %>% 
+  mutate(tumor = substr(select, 1, 4)) %>% dplyr::select(Gene, tumor, description, GO)
+
+TCGA_global_cor_info <- getBM(attributes = c("ensembl_gene_id", "external_gene_name", "description", "name_1006"),
+                   filter = "ensembl_gene_id",
+                   values = global_cor_10genes %>% .$GeneID,
+                   mart = mart) %>%
+  as_tibble() %>% 
+  group_by(ensembl_gene_id) %>% 
+  summarize(Gene = unique(external_gene_name), 
+            description = unique(rm_between(description, "[", "]")), 
+            GO = paste(name_1006, collapse = ", "))
+
+TCGA_global_cor_THCA_info <- getBM(attributes = c("ensembl_gene_id", "external_gene_name", "description", "name_1006"),
+                   filter = "ensembl_gene_id",
+                   values = global_cor_THCA_10genes %>% .$GeneID,
+                   mart = mart) %>%
+  as_tibble() %>% 
+  group_by(ensembl_gene_id) %>% 
+  summarize(Gene = unique(external_gene_name), 
+            description = unique(rm_between(description, "[", "]")), 
+            GO = paste(name_1006, collapse = ", "))
+
+TCGA_global_cor_by_tumor_info <- getBM(attributes = c("ensembl_gene_id", "external_gene_name", "description", "name_1006"),
+                   filter = "ensembl_gene_id",
+                   values = global_cor_10genes_by_tumor %>% .$GeneID,
+                   mart = mart) %>%
+  as_tibble() %>% 
+  group_by(ensembl_gene_id) %>% 
+  summarize(Gene = unique(external_gene_name), 
+            description = unique(rm_between(description, "[", "]")), 
+            GO = paste(name_1006, collapse = ", "))  %>% 
+  mutate(tumor = substr(global_cor_10genes_by_tumor$select, 1, 4)) %>% 
+  dplyr::select(Gene, tumor, description, GO)
+
+TCGA_global_cor_THCA_by_tumor_info <- getBM(attributes = c("ensembl_gene_id", "external_gene_name", "description", "name_1006"),
+                   filter = "ensembl_gene_id",
+                   values = global_cor_THCA_10genes_by_tumor %>% .$GeneID,
+                   mart = mart) %>%
+  as_tibble() %>% 
+  group_by(ensembl_gene_id) %>% 
+  summarize(Gene = unique(external_gene_name), 
+            description = unique(rm_between(description, "[", "]")), 
+            GO = paste(name_1006, collapse = ", "))  %>% 
+  mutate(tumor = substr(global_cor_THCA_10genes_by_tumor$select, 1, 4)) %>% 
+  dplyr::select(Gene, tumor, description, GO)
+```
+
+```{r,  test}
+kable(TCGA_gene_cor_info %>% dplyr::select(-ensembl_gene_id), caption = "TCGA gene correlations")
+kable(TCGA_gene_cor_THCA_info %>% dplyr::select(-ensembl_gene_id), caption = "TCGA gene correlations without THCA")
+kable(TCGA_gene_cor_by_tumor_info, caption = "TCGA gene correlations by tumor")
+kable(TCGA_gene_cor_THCA_by_tumor_info, caption = "TCGA gene correlations by tumor without THCA")
+kable(TCGA_global_cor_info %>% dplyr::select(-ensembl_gene_id), caption = "TCGA global correlations")
+kable(TCGA_global_cor_THCA_info %>% dplyr::select(-ensembl_gene_id), caption = "TCGA global correlations without THCA")
+kable(TCGA_global_cor_by_tumor_info, caption = "TCGA global correlations by tumor")
+kable(TCGA_global_cor_THCA_by_tumor_info, caption = "TCGA global correlations by tumor without THCA")
+```
+
+```{r, test2}
+## comparisons of significantly correlated genes (p < 0.5)
+
+## TCGA data
+upsetrList <- list(TCGA_gene_cor = TCGA_gene_cor %>% filter(pval < 0.05) %>% .$Gene,
+                   TCGA_gene_cor_by_tumor = TCGA_gene_cor_by_tumor$name, 
+                   TCGA_global_cor = TCGA_global_cor %>% filter(pval < 0.05) %>% .$Gene,
+                   TCGA_global_cor_by_tumor = TCGA_global_cor_by_tumor %>% filter(pval < 0.05) %>% .$Gene)
+upset(fromList(upsetrList), order.by = "freq")
+
+## TCGA data without THCA
+upsetrList <- list(TCGA_gene_cor_THCA = TCGA_gene_cor_THCA %>% filter(pval < 0.05) %>% .$Gene,
+                   TCGA_gene_cor_THCA_by_tumor = TCGA_gene_cor_THCA_by_tumor$Gene, 
+                   TCGA_global_cor_THCA = TCGA_global_cor_THCA %>% filter(pval < 0.05) %>% .$Gene,
+                   TCGA_global_cor_THCA_by_tumor = TCGA_global_cor_THCA_by_tumor %>% filter(pval < 0.05) %>% .$Gene)
+upset(fromList(upsetrList), order.by = "freq")
+
+## Gene correlations
+upsetrList <- list(TCGA_gene_cor = TCGA_gene_cor %>% filter(pval < 0.05) %>% .$Gene,
+                   TCGA_gene_cor_by_tumor = TCGA_gene_cor_by_tumor$Gene,
+                   TCGA_gene_cor_THCA = TCGA_gene_cor_THCA %>% filter(pval < 0.05) %>% .$Gene,
+                   TCGA_gene_cor_THCA_by_tumor = TCGA_gene_cor_THCA_by_tumor$Gene)
+upset(fromList(upsetrList), order.by = "freq")
+
+## Global correlations
+upsetrList <- list(TCGA_global_cor = TCGA_global_cor %>% filter(pval < 0.05) %>% .$Gene,
+                   TCGA_global_cor_by_tumor = TCGA_global_cor_by_tumor %>% filter(pval < 0.05) %>% .$Gene, 
+                   TCGA_global_cor_THCA = TCGA_global_cor_THCA %>% filter(pval < 0.05) %>% .$Gene,
+                   TCGA_global_cor_THCA_by_tumor = TCGA_global_cor_THCA_by_tumor %>% filter(pval < 0.05) %>% .$Gene)
+upset(fromList(upsetrList), order.by = "freq")
+```
+
+```{r, top10 cor from each tumor, warning = FALSE, fig.width = 20}
+## 10 comparing groups is too large for UpsetR
+
+gene_cor_upsetrList <- TCGA_gene_cor_by_tumor %>% 
+  filter(tumor != "READ") %>%
+  group_by(tumor) %>% 
+  top_n(n = 10, wt = abs(cor)) %>%
+  dplyr::select(tumor, Gene) %>% 
+  summarize(Gene = list(tumor = Gene)) %>% 
+  split(list(.$tumor)) %>% 
+  lapply(function(x) as.character(unlist(x))) 
+#upset(fromList(gene_cor_upsetrList), order.by = "freq")
+
+
+global_cor_upsetrList <- TCGA_global_cor_by_tumor %>%
+  group_by(tumor) %>% 
+  top_n(n = 10, wt = abs(cor)) %>% 
+  dplyr::select(tumor, Gene) %>% 
+  summarize(Gene = list(tumor = Gene)) %>% 
+  split(list(.$tumor)) %>% lapply(function(x) as.character(unlist(x))) 
+#upset(fromList(global_cor_upsetrList), order.by = "freq")
+
+```
+
+
+
+
+##RBP data
+
+```{r, read in and filter data, warning = FALSE}
+## filter out low expressing genes (tpm < 5)
+ECtpm <- read.table("ENCODEtpms2.0.txt", header = TRUE)
+ECtpm <- ECtpm %>% 
+  as_tibble() %>%
+  gather(-Gene, key = sample, value = tpm) %>% 
+  filter(tpm > 5)
+
+EClog2FC <- read.table("ENCODElog2EC2.0.txt", header = TRUE)
+EClog2FC <- EClog2FC %>% 
+  as_tibble() %>%
+  filter(Gene %in% ECtpm$Gene) %>%
+  gather(-Gene, key = sample, value = log2FC) %>% 
+  separate(sample, into = c("sample", "cell", "type"), sep = "_") %>%
+  dplyr::select(-type) 
+
+EClog2FC[mapply(is.infinite, EClog2FC)] <- NA
+EClog2FC <- EClog2FC %>% na.omit()
+
+##read in cell type psi_sig and filter for sig
+
+HepG2_psi_sig <- read.table("HepG2.psi.pval2.0.txt", header = TRUE)
+HepG2_psi_sig <- HepG2_psi_sig %>% 
+  as_tibble() %>% 
+  dplyr::select(Gene, contains("qval")) %>% 
+  gather(-Gene, key = sample, value = qval) %>% 
+  separate(sample, into = c("sample", "cell", "type"), sep = "_") %>%
+  dplyr::select(-type) %>%
+  filter(qval < 0.05) %>%
+  mutate(Gene = as.character(Gene))
+
+K562_psi_sig <- read.table("K562.psi.pval2.0.txt", header = TRUE)
+K562_psi_sig <- K562_psi_sig %>% 
+  as_tibble() %>% 
+  dplyr::select(Gene, contains("qval")) %>%
+  gather(-Gene, key = sample, value = qval) %>%
+  separate(sample, into = c("sample", "cell", "type"), sep = "_") %>%
+  dplyr::select(-type) %>% 
+  filter(qval < 0.05) %>% 
+  mutate(Gene = as.character(Gene))
+
+
+##combine sig cell type dpsi 
+
+HepG2_psi <- read.table("HepG2.dpsi2.0.txt", header = TRUE)
+HepG2_psi <- HepG2_psi %>%
+  as_tibble() %>%
+  gather(-Gene, key = sample, value = psi) %>%
+  separate(sample, into = c("sample", "cell", "type"), sep = "_") %>%
+  dplyr::select(-type) %>%
+  mutate(Gene = as.character(Gene), med_psi = psi) %>% 
+  left_join(HepG2_psi_sig) %>% 
+  na.omit()
+
+K562_psi <- read.table("K562.dpsi2.0.txt", header = TRUE)
+K562_psi <- K562_psi %>% 
+  as_tibble() %>%
+  gather(-Gene, key = sample, value = psi) %>% 
+  separate(sample, into = c("sample", "cell", "type"), sep = "_") %>%
+  dplyr::select(-type) %>% 
+  mutate(Gene = as.character(Gene), med_psi = psi) %>%
+  left_join(K562_psi_sig)  %>%
+  na.omit()
+
+
+sum(K562_psi$Gene %in% HepG2_psi$Gene)
+
+##put it all together
+
+RBP_psi <- rbind(HepG2_psi, K562_psi)
+RBP_psi_exp <- left_join(EClog2FC, RBP_psi) %>%
+  mutate(med_psi = psi) %>% 
+  group_by(sample) %>%
+  mutate_at(.vars = "med_psi", .funs = median, na.rm = TRUE) %>% 
+  ungroup() %>% 
+  left_join(gene_name, by = c("Gene" = "GeneID")) %>% 
+  mutate(GeneID = Gene, Gene = Gene.y)
+
+```
+
+```{r, correlation analysis II, warning = FALSE}
+##get error: Cannot compute exact p-value with ties
+
+RBP_gene_cor <- RBP_psi_exp %>% 
+  dplyr::select(-med_psi) %>% 
+  na.omit() %>% 
+  group_by(GeneID) %>%
+  summarize(n = n(),
+            cor = ifelse(n > 3, as.numeric(cor.test(psi, log2FC, method = "spearman", exact = TRUE)[4]), NA),
+            pval = ifelse(n > 3, as.numeric(cor.test(psi, log2FC, method = "spearman", exact = TRUE)[3]), NA),
+            Gene = unique(Gene)) %>%
+  na.omit()
+
+RBP_gene_cor_by_cell <- RBP_psi_exp %>%
+  dplyr::select(-med_psi) %>% 
+  na.omit() %>% 
+  group_by(GeneID, cell) %>% 
+  summarize(n = n(), 
+            cor = ifelse(n > 3, as.numeric(cor.test(psi, log2FC, method = "spearman")[4]), NA),
+            pval = ifelse(n > 3, as.numeric(cor.test(psi, log2FC, method = "spearman")[3]), NA),
+            Gene = unique(Gene)) %>% 
+  na.omit()
+
+
+RBP_global_cor <- RBP_psi_exp %>% 
+  group_by(GeneID) %>%
+  summarize(n = n(), 
+            cor = ifelse(n > 3, as.numeric(cor.test(med_psi, log2FC, method = "spearman")[4]), NA),
+            pval = ifelse(n > 3, as.numeric(cor.test(med_psi, log2FC, method = "spearman")[3]), NA),
+            Gene = unique(Gene)) %>%
+  na.omit()
+
+RBP_global_cor_by_cell <- RBP_psi_exp %>%  
+  group_by(GeneID, cell) %>%
+  summarize(n = n(), 
+            cor = ifelse(n > 3, as.numeric(cor.test(med_psi, log2FC, method = "spearman")[4]), NA),
+            pval = ifelse(n > 3, as.numeric(cor.test(med_psi, log2FC, method = "spearman")[3]), NA),
+            Gene = unique(Gene)) %>% 
+  na.omit()
+
+```
+
+```{r, plotsII, warning = FALSE, fig.width = 20}
+## filter by a sample size of 50 and top 10 abs(cor)
+
+RBP_gene_cor_10genes <- RBP_gene_cor %>%
+  filter(n > 50) %>% 
+  arrange(abs(cor)) %>%
+  top_n(10, wt = abs(cor))
+RBP_gene_cor_10genes_by_cell <- RBP_gene_cor_by_cell %>% 
+  ungroup() %>% 
+  filter(n > 50) %>%
+  arrange(abs(cor)) %>% 
+  top_n(10, wt = abs(cor)) %>%
+  unite(cell, Gene, col = select, sep = "-")
+
+RBP_global_cor_10genes <- RBP_global_cor %>% 
+  filter(n > 50) %>% arrange(abs(cor)) %>% 
+  top_n(10, wt = abs(cor))
+RBP_global_cor_10genes_by_cell <- RBP_global_cor_by_cell %>% 
+  ungroup() %>% filter(n > 50) %>%
+  arrange(abs(cor)) %>% 
+  top_n(10, wt = abs(cor)) %>%
+  unite(cell, Gene, col = select, sep = "-")
+
+## plot it up
+
+label <- facet_cor_eqn((RBP_psi_exp %>% filter(Gene %in% RBP_gene_cor_10genes$Gene)),
+                       (RBP_psi_exp %>% filter(Gene %in% RBP_gene_cor_10genes$Gene))$Gene, 
+                       "psi", 
+                       "log2FC")
+RBP_psi_exp %>% 
+  filter(Gene %in% RBP_gene_cor_10genes$Gene) %>% 
+  ggplot(aes(psi, log2FC, col = cell)) +
+  geom_point() + 
+  geom_smooth(aes(psi, log2FC), method = lm, se = FALSE, inherit.aes = FALSE) + 
+  facet_grid(.~factor(Gene, levels = RBP_gene_cor_10genes$Gene), scales = "free_x") + 
+  geom_text(aes(x, y, label = Rho),
+            parse = TRUE,
+            data = data.frame(x = 0,
+                              y = 5.5,
+                              Rho = unlist(label)[seq(1, length(label), 2)], 
+                              Gene = names(label[seq(1, length(label), 2)]),
+                              cell = NA)) +
+  geom_text(aes(x, y, label = pval), 
+            parse = TRUE,
+            data = data.frame(x = 0,
+                              y = 5, 
+                              pval = unlist(label)[seq(2, length(label), 2)], 
+                              Gene = names(label[seq(2, length(label), 2)]),
+                              cell = NA)) +
+  geom_text(aes(x,y,label = n),
+            parse = TRUE,
+            data = data.frame(x = 0,
+                              y = 4.5,
+                              n = RBP_gene_cor_10genes$n,
+                              Gene = RBP_gene_cor_10genes$Gene,
+                              cell = NA)) + 
+  labs(title = "RBP gene correlations") + theme_cowplot()
+
+label <- facet_cor_eqn((RBP_psi_exp %>% unite(cell, Gene, col = select, sep = "-") %>% filter(select %in% RBP_gene_cor_10genes_by_cell$select)),
+                       (RBP_psi_exp %>% unite(cell, Gene, col = select, sep = "-") %>% filter(select %in% RBP_gene_cor_10genes_by_cell$select))$select,
+                       "psi",
+                       "log2FC")
+RBP_psi_exp %>% 
+  unite(cell, Gene, col = select, sep = "-") %>% 
+  filter(select %in% RBP_gene_cor_10genes_by_cell$select) %>%
+  ggplot(aes(psi, log2FC)) + 
+  geom_point() +
+  geom_smooth(method = lm, se = FALSE) + 
+  facet_grid(.~factor(select, levels = RBP_gene_cor_10genes_by_cell$select), scales = "free_x") +
+  geom_text(aes(x, y, label = Rho),
+            parse = TRUE, 
+            data = data.frame(x = 0, 
+                              y = 5.5, 
+                              Rho = unlist(label)[seq(1, length(label), 2)], 
+                              select = names(label[seq(1, length(label), 2)]))) + 
+  geom_text(aes(x, y, label = pval), 
+            parse = TRUE,
+            data = data.frame(x = 0,
+                              y = 5, 
+                              pval = unlist(label)[seq(2, length(label), 2)], 
+                              select = names(label[seq(2, length(label), 2)]))) +
+  geom_text(aes(x,y,label = n),
+            parse = TRUE,
+            data = data.frame(x = 0,
+                              y = 4.5,
+                              n = RBP_gene_cor_10genes_by_cell$n,
+                              select = RBP_gene_cor_10genes_by_cell$select)) +
+  labs(title = "RBP gene correlations by cell") + theme_cowplot()
+
+
+label <- facet_cor_eqn((RBP_psi_exp %>% filter(Gene %in% RBP_global_cor_10genes$Gene)), 
+                       (RBP_psi_exp %>% filter(Gene %in% RBP_global_cor_10genes$Gene))$Gene, 
+                       "med_psi",
+                       "log2FC")
+RBP_psi_exp %>% 
+  filter(Gene %in% RBP_global_cor_10genes$Gene) %>%
+  ggplot(aes(med_psi, log2FC, col = cell)) + 
+  geom_point()  + 
+  geom_smooth(aes(med_psi, log2FC), method = lm, se = FALSE, inherit.aes = FALSE) + 
+  facet_grid(.~factor(Gene, levels = RBP_global_cor_10genes$Gene), scales = "free_x") + 
+  geom_text(aes(x, y, label = Rho),
+            parse = TRUE, 
+            data = data.frame(x = 0,
+                              y = 5, 
+                              Rho = unlist(label)[seq(1, length(label), 2)], 
+                              Gene = names(label[seq(1, length(label), 2)]),
+                              cell = NA)) + 
+  geom_text(aes(x, y, label = pval),
+            parse = TRUE, 
+            data = data.frame(x = 0,
+                              y = 4.5,
+                              pval = unlist(label)[seq(2, length(label), 2)], 
+                              Gene = names(label[seq(2, length(label), 2)]),
+                              cell = NA)) +
+   geom_text(aes(x,y,label = n),
+            parse = TRUE,
+            data = data.frame(x = 0,
+                              y = 4,
+                              n = RBP_global_cor_10genes$n,
+                              Gene = RBP_global_cor_10genes$Gene,
+                              cell = NA)) +
+  labs(title = "RBP global correlations") + theme_cowplot()
+
+label <- facet_cor_eqn((RBP_psi_exp %>% unite(cell, Gene, col = select, sep = "-") %>% filter(select %in% RBP_global_cor_10genes_by_cell$select)),
+                       (RBP_psi_exp %>% unite(cell, Gene, col = select, sep = "-") %>% filter(select %in% RBP_global_cor_10genes_by_cell$select))$select, 
+                       "med_psi", 
+                       "log2FC")
+RBP_psi_exp %>% 
+  unite(cell, Gene, col = select, sep = "-") %>%
+  filter(select %in% RBP_global_cor_10genes_by_cell$select) %>% 
+  ggplot(aes(med_psi, log2FC)) + 
+  geom_point() + 
+  geom_smooth(method = lm, se = FALSE) + 
+  facet_grid(.~factor(select, levels = RBP_global_cor_10genes_by_cell$select), scales = "free_x") + 
+  geom_text(aes(x, y, label = Rho), 
+            parse = TRUE, 
+            data = data.frame(x = 0,
+                              y = 3,
+                              Rho = unlist(label)[seq(1, length(label), 2)], 
+                              select = names(label[seq(1, length(label), 2)]))) +
+  geom_text(aes(x, y, label = pval), 
+            parse = TRUE,
+            data = data.frame(x = 0, 
+                              y = 2.5, 
+                              pval = unlist(label)[seq(2, length(label), 2)], 
+                              select = names(label[seq(2, length(label), 2)]))) +
+  geom_text(aes(x,y,label = n),
+            parse = TRUE,
+            data = data.frame(x = 0,
+                              y = 2,
+                              n = RBP_global_cor_10genes_by_cell$n,
+                              select = RBP_global_cor_10genes_by_cell$select)) +
+  labs(title = "RBP global correlations by cell") + theme_cowplot()
+
+```
+
+```{r, TUBA1A?}
+
+#ENSG00000167552
+
+
+#RBP_psi_exp %>% 
+#  filter(Gene == "TUBA1A") %>% 
+#  ggplot(aes(psi, log2FC, col = cell)) +
+#  geom_point() + 
+#  geom_smooth(aes(psi, log2FC), method = lm, se = FALSE, inherit.aes = FALSE) + 
+#  labs(title = "RBP gene correlations") + theme_cowplot()
+```
+
+```{r, what are these genes II, warning = FALSE}
+RBP_gene_cor_info <- getBM(attributes = c("ensembl_gene_id", "external_gene_name", "description", "name_1006"),
+                   filter = "ensembl_gene_id",
+                   values = RBP_gene_cor_10genes %>% .$GeneID,
+                   mart = mart) %>% 
+  as_tibble() %>% 
+  group_by(ensembl_gene_id) %>% 
+  summarize(name = unique(external_gene_name), 
+            description = unique(rm_between(description, "[", "]")), 
+            GO = paste(name_1006, collapse = ","))
+  
+  
+RBP_gene_cor_by_cell_info <- getBM(attributes = c("ensembl_gene_id", "external_gene_name", "description", "name_1006"),
+                   filter = "ensembl_gene_id",
+                   values = RBP_gene_cor_10genes_by_cell %>% .$GeneID,
+                   mart = mart) %>% 
+  as_tibble() %>% 
+  group_by(ensembl_gene_id) %>% 
+  summarize(Gene = unique(external_gene_name), 
+            description = unique(rm_between(description, "[", "]")), 
+            GO = paste(name_1006, collapse = ",")) %>% 
+  #mutate(cell = substr(RBP_gene_cor_10genes_by_cell$select, 1, 5)) %>% 
+  dplyr::select(Gene, description, GO)
+
+RBP_global_cor_info <- getBM(attributes = c("ensembl_gene_id", "external_gene_name", "description", "name_1006"),
+                   filter = "ensembl_gene_id",
+                   values = RBP_global_cor_10genes %>% .$GeneID,
+                   mart = mart) %>% 
+  as_tibble() %>% 
+  group_by(ensembl_gene_id) %>% 
+  summarize(name = unique(external_gene_name), 
+            description = unique(rm_between(description, "[", "]")), 
+            GO = paste(name_1006, collapse = ","))
+
+RBP_global_cor_by_cell_info <- getBM(attributes = c("ensembl_gene_id", "external_gene_name", "description", "name_1006"),
+                   filter = "ensembl_gene_id",
+                   values = RBP_global_cor_10genes_by_cell %>% .$GeneID,
+                   mart = mart) %>%
+  as_tibble() %>% 
+  group_by(ensembl_gene_id) %>% 
+  summarize(name = unique(external_gene_name), 
+            description = unique(rm_between(description, "[", "]")), 
+            GO = paste(name_1006, collapse = ",")) %>% 
+ # mutate(cell = substr(RBP_global_cor_10genes_by_cell$select, 1, 5)) %>% 
+  dplyr::select(name, description, GO)
+
+kable(RBP_gene_cor_info %>% dplyr::select(-ensembl_gene_id), caption = "RBP gene correlations")
+kable(RBP_gene_cor_by_cell_info, caption = "RBP gene correlations by cell")
+kable(RBP_global_cor_info %>% dplyr::select(-ensembl_gene_id), caption = "RBP global correlations")
+kable(RBP_global_cor_by_cell_info, caption = "RBP global correlations by cell")
+
+## comparisons of significanly correlated genes
+upsetrList <- list(RBP_gene_cor = RBP_gene_cor %>% filter(pval < 0.5) %>% .$Gene,
+                   RBP_gene_cor_by_cell = RBP_gene_cor_by_cell %>% filter(pval < 0.5) %>% .$Gene,
+                   RBP_global_cor = RBP_global_cor %>% filter(pval < 0.5) %>% .$Gene,
+                   RBP_global_cor_by_cell = RBP_global_cor_by_cell %>% filter(pval < 0.5) %>% .$Gene)
+upset(fromList(upsetrList), order.by = "freq")
+```
+
+```{r, RBP TCGA comparisons, warning = FALSE}
+## Can't show all  comparisons, (6 is too many, cut out RBP by cell data)
+upsetrList <- list(TCGA_gene_cor = TCGA_gene_cor %>% filter(pval < 0.5) %>% .$Gene,
+                   TCGA_gene_cor_by_tumor = TCGA_gene_cor_by_tumor$Gene,
+                   TCGA_gene_cor_THCA = TCGA_gene_cor_THCA %>% filter(pval < 0.5) %>% .$Gene,
+                   TCGA_gene_cor_THCA_by_tumor = TCGA_gene_cor_THCA_by_tumor$Gene,
+                   RBP_gene_cor = RBP_gene_cor %>% filter(pval < 0.5) %>% .$Gene)
+upset(fromList(upsetrList), order.by = "freq")
+
+
+upsetrList <- list(TCGA_global_cor = TCGA_gene_cor %>% filter(pval < 0.5) %>% .$Gene,
+                   TCGA_global_cor_by_tumor = TCGA_gene_cor_by_tumor$Gene,
+                   TCGA_global_cor_THCA = TCGA_gene_cor_THCA %>% filter(pval < 0.5) %>% .$Gene,
+                   TCGA_global_cor_THCA_by_tumor = TCGA_gene_cor_THCA_by_tumor$Gene,
+                   RBP_global_cor = RBP_gene_cor %>% filter(pval < 0.5) %>% .$Gene)
+upset(fromList(upsetrList), order.by = "freq")
+
+
+
+```
+
+```{r, correlation of correlations, warning = FALSE}
+corofcor <- left_join(TCGA_gene_cor, RBP_gene_cor, by = c("GeneID", "Gene")) %>% na.omit() %>% summarize(corofcor = as.numeric(cor.test(cor.x, cor.y, method = "spearman")[4]), corofcor_pval = as.numeric(cor.test(cor.x, cor.y, method = "spearman")[3]))
+
+corofcor_THCA <- left_join(TCGA_gene_cor_THCA, RBP_gene_cor, by = c("GeneID", "Gene")) %>% na.omit() %>% summarize(corofcor = as.numeric(cor.test(cor.x, cor.y, method = "spearman")[4]), corofcor_pval = as.numeric(cor.test(cor.x, cor.y, method = "spearman")[3]))
+
+left_join(TCGA_gene_cor, RBP_gene_cor, by = c("GeneID", "Gene")) %>% na.omit() %>% ggplot(aes(x = cor.x, y = cor.y)) + geom_point() +
+  geom_smooth(aes(cor.x, cor.y), method = lm, se = FALSE, inherit.aes = FALSE) + labs(title = "Correlations of TCGA and ENCODE correlations", y = "Correlation in ENCODE", x = "Correlation in TCGA") + geom_text(aes(-0.5, 1, label = paste("rho = ", round(corofcor$corofcor, digits = 3)))) + geom_text(aes(-0.5, 0.75, label = paste("pval = ", formatC(corofcor$corofcor_pval, format = "e", digits = 3)))) + theme_cowplot()
+
+left_join(TCGA_gene_cor_THCA, RBP_gene_cor, by = c("GeneID", "Gene")) %>% na.omit() %>% ggplot(aes(x = cor.x, y = cor.y)) + geom_point() +
+  geom_smooth(aes(cor.x, cor.y), method = lm, se = FALSE, inherit.aes = FALSE) + labs(title = "Correlations of TCGA-THCA and ENCODE correlations", y = "Correlation in ENCODE", x = "Correlation in TCGA-THCA") + geom_text(aes(-0.5, 1, label = paste("rho = ", round(corofcor_THCA$corofcor, digits = 3)))) + geom_text(aes(-0.5, 0.75, label = paste("pval = ", formatC(corofcor_THCA$corofcor_pval, format = "e", digits = 3)))) + theme_cowplot()
+
+##histogram of gene cor
+left_join(TCGA_gene_cor, RBP_gene_cor, by = c("GeneID", "Gene")) %>% na.omit() %>% rename("TCGA" = "cor.x", ENCODE = "cor.y") %>%  gather(TCGA, ENCODE, key = dat, value = cor) %>% ggplot(aes(x = cor, fill = dat)) + geom_density(aes(x = cor, fill = dat), alpha = 0.2) + theme_cowplot() + geom_vline(xintercept = 0)
+
+TCGA_gene_cor_by_tumor %>% ggplot(aes(x = cor, fill = tumor)) + geom_density(aes(x = cor, fill = tumor), alpha = 0.2) + theme_cowplot() + geom_vline(xintercept = 0)
+
+## what fraction of genes have negative correlations?
+(TCGA_gene_cor %>% filter(cor < 0) %>% nrow()) / nrow(TCGA_gene_cor) * 100  ## 76.75%
+(RBP_gene_cor %>% filter(cor < 0) %>% nrow()) / nrow(RBP_gene_cor) * 100   ## 69.21%
+
+```
+
+```{r,  null distributions, warning = FALSE}
+
+## more histograms with null distributions
+
+TCGA_dat <- TCGA_psi_exp %>% na.omit()
+TCGA_dat_cor <- TCGA_dat %>% dplyr::select(-med_psi) %>% na.omit() %>% group_by(GeneID) %>%  summarize(n = n(),
+            cor = ifelse(n > 3, as.numeric(cor.test(psi, log2FC, method = "spearman")[4]), NA)) %>% mutate(dat = "dat") 
+
+##shuffle psi and expression data before calculating correlations
+TCGA_null <- TCGA_dat 
+TCGA_null$psi <- sample(TCGA_dat$psi, replace = FALSE)
+TCGA_null$log2FC <- sample(TCGA_dat$log2FC, replace = FALSE)
+
+TCGA_null_cor <- TCGA_null %>% dplyr::select(-med_psi) %>% na.omit() %>% group_by(GeneID) %>%  summarize(n = n(),
+            cor = ifelse(n > 3, as.numeric(cor.test(psi, log2FC, method = "spearman")[4]), NA)) %>% mutate(dat = "null")
+
+rbind(TCGA_dat_cor, TCGA_null_cor) %>% ggplot(aes(x = cor, fill = dat)) + geom_density(aes(x = cor, fill = dat), alpha = 0.2) + theme_cowplot() + geom_vline(xintercept = 0)
+
+t.test(TCGA_dat_cor$cor, TCGA_null_cor$cor)[3]
+wilcox.test(TCGA_dat_cor$cor, TCGA_null_cor$cor)[3]
+
+
+##Repeat with encode data
+RBP_dat <- RBP_psi_exp %>% dplyr::select(-med_psi) %>%  na.omit() 
+RBP_dat_cor <- RBP_dat %>% group_by(GeneID) %>%
+  summarize(n = n(), cor = ifelse(n > 3, as.numeric(cor.test(psi, log2FC, method = "spearman", exact = TRUE)[4]), NA)) %>% dplyr::select(GeneID, cor) %>% mutate(dat = "dat") 
+
+##shuffle psi and expression data before calculating correlations
+RBP_null <- RBP_dat 
+RBP_null$psi <- sample(RBP_dat$psi, replace = FALSE)
+RBP_null$log2FC <- sample(RBP_dat$log2FC, replace = FALSE)
+
+RBP_null_cor <- RBP_null %>% group_by(GeneID) %>%
+  summarize(n = n(), cor = ifelse(n > 3, as.numeric(cor.test(psi, log2FC, method = "spearman", exact = TRUE)[4]), NA)) %>% dplyr::select(GeneID, cor) %>% mutate(dat = "null")
+
+rbind(RBP_dat_cor, RBP_null_cor) %>% ggplot(aes(x = cor, fill = dat)) + geom_density(aes(x = cor, fill = dat), alpha = 0.2) + theme_cowplot() + geom_vline(xintercept = 0)
+
+t.test(RBP_dat_cor$cor, RBP_null_cor$cor)[3]
+wilcox.test(RBP_dat_cor$cor, RBP_null_cor$cor)[3]
+
+```
