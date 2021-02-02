@@ -21,7 +21,7 @@ library(UpSetR)
 
 ```{r, read in and tidy TCGA psi and log2FC, warning = FALSE}
 ## psi data from Matt, values are significant delta psis between healthy and tumorous tissue
-psis <- read.table("TCGApsis2.0.txt", header = TRUE) 
+psis <- read.table("data/TCGApsis2.0.txt", header = TRUE) 
 psis_tidy <- as_tibble(psis) %>% 
   mutate(sample = as.character(sample),
          sample = substr(sample, 6, nchar(sample)-5),
@@ -52,7 +52,7 @@ gene_name <- getBM(attributes = c("ensembl_gene_id", "external_gene_name"),
 
 ## Expression data not significant, all expressed genes (above a threshold).
 x <- c(1:19)
-tumor_exp <- lapply(x, function(x) read.table(paste(paste("ExpressionTables2/", cancer_types[x], sep = ""), ".txt", sep = ""), header = TRUE))
+tumor_exp <- lapply(x, function(x) read.table(paste(paste("data/ExpressionTables2/", cancer_types[x], sep = ""), ".txt", sep = ""), header = TRUE))
 
 exp_tidy <- tumor_exp %>% 
   Reduce(function(dtf1,dtf2) full_join(dtf1,dtf2,by="Gene"), .) %>% 
@@ -1108,5 +1108,40 @@ rbind(RBP_dat_cor, RBP_null_cor) %>% ggplot(aes(x = cor, fill = dat)) + geom_den
 
 t.test(RBP_dat_cor$cor, RBP_null_cor$cor)[3]
 wilcox.test(RBP_dat_cor$cor, RBP_null_cor$cor)[3]
+
+```
+
+
+```{r, mystery}
+ExpCor <- read.table("data/Psi_exp_cor_TCGA_and_Encode.txt", header = TRUE) %>% as_tibble()
+AllCond <- read.table("data/allcondition_allgene_psiexp.txt", header = TRUE) %>% as_tibble()
+
+AllCond_cor <- AllCond %>%
+  mutate(type = ifelse(grepl("K562", as.character(.$sample)) | grepl("HepG2", as.character(.$sample)), "Encode", "TCGA")) %>% 
+  group_by(ensembl_gene_id, type) %>%
+  na.omit() %>%
+  summarize(n = n(),
+            cor = ifelse(n > 3, as.numeric(cor.test(psi, log2FC, method = "spearman")[4]), NA),
+            pval = ifelse(n > 3, as.numeric(cor.test(psi, log2FC, method = "spearman")[3]), NA),
+            Gene = unique(Gene)) %>% 
+  dplyr::select(-pval, -n, -Gene) %>% 
+  spread(key = type, value = cor)
+
+File_compare <- left_join(ExpCor, AllCond_cor, by = c("GeneID" = "ensembl_gene_id")) 
+
+File_compare %>% ggplot(aes(TCGA_cor, TCGA)) + geom_point() + geom_smooth(aes(TCGA_cor, TCGA), method = lm, se = FALSE, inherit.aes = FALSE) + theme_cowplot() 
+
+File_compare %>% ggplot(aes(ENCODE_cor, Encode)) + geom_point() + geom_smooth(aes(TCGA_cor, TCGA), method = lm, se = FALSE, inherit.aes = FALSE) + theme_cowplot()
+
+##Maybe matt is being dumb
+
+wrong_cor <- AllCond %>% 
+  group_by(ensembl_gene_id) %>%  
+  na.omit() %>% summarize(n = n(),
+                          cor = ifelse(n > 3, as.numeric(cor.test(psi, log2FC, method = "spearman")[4]), NA),
+                          pval = ifelse(n > 3, as.numeric(cor.test(psi, log2FC, method = "spearman")[3]), NA),
+                          Gene = unique(Gene))
+
+wrong_File_compare <- left_join(ExpCor, wrong_cor, by = c("GeneID" = "ensembl_gene_id"))
 
 ```

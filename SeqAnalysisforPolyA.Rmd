@@ -1,0 +1,2299 @@
+---
+title: "SequenceAnalysis4PolyA"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(Biostrings)
+library(cowplot)
+library(ggpubr)
+library(GenomicFeatures)
+library("BSgenome.Hsapiens.NCBI.GRCh38")
+library(enrichR)
+library(biomaRt)
+library(RNAreachR)
+library(UpSetR)
+library(ggrepel)
+
+`%notin%` <- Negate(`%in%`)
+
+```
+
+
+```{r, get polya UTR gff, echo = FALSE}
+##prepare polya gff
+#polya_gff <- rtracklayer::import("data/uniqueutrcoords.gff") #import
+#polya_gff <- polya_gff[!grepl("_PAR_Y", polya_gff$ID)] #remove weird Y chromosome haplotype (>10 genes)
+
+#only interested in genes with two alternative UTRs (this is true for ~50% of genes)
+#twoUTRids <- polya_gff %>% 
+#  as_tibble() %>% 
+#  filter(type == "uniqueUTR", 
+#         number_of_uniqueseqs == 2) %>% 
+#  mutate(tx_name = paste(str_match(ID, "(.*?)\\.(.*?)_uniqueUTR(.?)")[,2],
+#                         "_uniqueUTR",
+#                         str_match(ID, "(.*?)\\.(.*?)_uniqueUTR(.?)")[,4],
+#                         sep = "")) %>% 
+#  pull(., tx_name)
+
+
+##make txdb object
+##first create transcripts, splicings and gene dataframes with required functions
+#transcripts <- polya_gff %>% 
+#  as_tibble() %>% 
+#  filter(type == "uniqueUTR") %>% 
+#  mutate(tx_id = as.integer(paste(str_match(ID, "ENSG(.*?)\\.(.*?)_uniqueUTR(.?)")[,2], 
+#                                  str_match(ID, "ENSG(.*?)\\.(.*?)_uniqueUTR(.?)")[,3], 
+#                                  str_match(ID, "ENSG(.*?)\\.(.*?)_uniqueUTR(.?)")[,4], 
+#                                  sep = "")), 
+#         tx_name = paste(str_match(ID, "(.*?)\\.(.*?)_uniqueUTR(.?)")[,2], 
+#                         "_uniqueUTR", 
+#                         str_match(ID, "(.*?)\\.(.*?)_uniqueUTR(.?)")[,4], 
+#                         sep = "")) %>% 
+#  dplyr::rename("tx_chrom" = seqnames, 
+#                "tx_strand" = strand, 
+#                "tx_start" = start, 
+#                "tx_end" = end) %>% 
+#  dplyr::select(tx_chrom, tx_start, tx_end, tx_strand, tx_id, tx_name) %>% 
+#  filter(tx_name %in% twoUTRids)
+
+#splicings <- polya_gff %>% 
+#  as_tibble() %>% 
+#  filter(type == "uniqueUTRexon") %>% 
+#  mutate(tx_id = as.integer(paste(str_match(ID, "ENSG(.*?)\\.(.*?)_uniqueUTR(.?)")[,2],
+#                                  str_match(ID, "ENSG(.*?)\\.(.*?)_uniqueUTR(.?)")[,3], 
+#                                  str_match(ID, "ENSG(.*?)\\.(.*?)_uniqueUTR(.?)")[,4], 
+#                                  sep = "")), 
+#         tx_name = paste(str_match(ID, "(.*?)\\.(.*?)_uniqueUTR(.?)")[,2], 
+#                         "_uniqueUTR", 
+#                         str_match(ID, "(.*?)\\.(.*?)_uniqueUTR(.?)")[,4],
+#                         sep = ""),
+#         exon_rank = as.integer(str_match(ID, "ENSG(.*?)\\.(.*?)_uniqueUTR(.?)_exon(.*)")[,5])) %>% 
+#  dplyr::rename("exon_start" = start, 
+#                "exon_end" = end)  %>% 
+#  filter(tx_name %in% twoUTRids) %>% 
+#  dplyr::select(exon_start, exon_end, tx_id, exon_rank)
+
+#genes <- polya_gff %>%
+#  as_tibble() %>% 
+#  filter(type == "uniqueUTR") %>%
+#  mutate(gene_id = substr(ID, 1, 15), 
+#         tx_name = paste(str_match(ID, "(.*?)\\.(.*?)_uniqueUTR(.?)")[,2],
+#                         "_uniqueUTR", 
+#                         str_match(ID, "(.*?)\\.(.*?)_uniqueUTR(.?)")[,4], 
+#                         sep = "")) %>% 
+#  dplyr::select(tx_name, gene_id) %>% 
+#  filter(tx_name %in% twoUTRids)
+
+##Make the actual TxDb object
+#polya_gff_txdb <- makeTxDb(transcripts, splicings, genes)
+#seqlevelsStyle(polya_gff_txdb) <- "NCBI"
+
+#saveDb(polya_gff_txdb, file="twoUTR_polya_gff_txdb.sqlite")
+
+polya_gff_txdb <- loadDb("twoUTR_polya_gff_txdb.sqlite")
+seqlevelsStyle(polya_gff_txdb) <- "NCBI"
+```
+
+## Some genes have expression which is correlated with psi values or alternative polyadenylation decisions.
+In some cases, these metrics are positively corrleated indicating that expression increases as longer UTRs are used (or stability decreases as shorter UTRs are used). In other cases, expression and APA are negatively correlated indicating the opposite trends (more expressed short UTRs or unstable long UTRs).
+
+This document is exploring the sequence content of these genes and their UTRs.
+
+First, we must define three groups of genes: Negatively Correlated, Control Genes (not correlated), and Positively Correlated.
+below we correlate expression and psi values from two datasets: TCGA tumor and health matched samples and ENCODE RBP knockdown data.
+
+```{r,  get genes, warning = FALSE}
+##Read in data to correlate
+#all <- read.table("data/allcondition_allgene_psiexp.txt", header = TRUE) %>% as_tibble()
+
+##correlate data (psi and expression values for TCGA and encode data separately)
+#all_cor <- all %>%
+#  mutate(type = ifelse(grepl("K562", as.character(.$sample)) | grepl("HepG2", as.character(.$sample)), "Encode", "TCGA")) %>% 
+#  group_by(ensembl_gene_id, type) %>%
+#  na.omit() %>%
+#  summarize(n = n(),
+#            cor = ifelse(n > 3, as.numeric(cor.test(psi, log2FC, method = "spearman")[4]), NA),
+#            pval = ifelse(n > 3, as.numeric(cor.test(psi, log2FC, method = "spearman")[3]), NA),
+#            Gene = unique(Gene),
+#            p_adj = p.adjust(pval, method = "BH", nrow(.)),
+#            mean_psi = mean(psi, na.rm = TRUE),
+#            mean_log2FC = mean(log2FC, na.rm = TRUE))
+
+#saveRDS(all_cor, "all_correlations_TCGA_encode")
+all_cor <- readRDS("all_correlations_TCGA_encode")
+
+'%!in%' <- Negate('%in%')
+
+#----------------
+##Initially I was too stringent and used pvalue cutoffs
+##gene groups are defined by significant correlation in pos/neg direction
+#TCGA_pos <- all_cor %>% filter(type == "TCGA", cor > 0, p_adj < 0.15) %>% pull(., ensembl_gene_id) %>% as.character()
+#TCGA_neg <- all_cor %>% filter(type == "TCGA", cor < 0, p_adj < 0.05) %>% pull(., ensembl_gene_id) %>% as.character()
+#RBP_pos <- all_cor %>% filter(type == "Encode", cor > 0, p_adj < 0.15) %>% pull(., ensembl_gene_id) %>% as.character()
+#RBP_neg <- all_cor %>% filter(type == "Encode", cor < 0, p_adj < 0.05) %>% pull(., ensembl_gene_id) %>% as.character()
+
+##These lists are combined and filtered for genes behaving inconsistently (> 2% of genes)
+#pos_genes <- c(TCGA_pos, RBP_pos) %>% unique() %>% .[. %!in% RBP_neg] %>% .[. %!in% TCGA_neg] #54genes
+#neg_genes <- c(TCGA_neg, RBP_neg) %>% unique() %>% .[. %!in% RBP_pos] %>% .[. %!in% TCGA_pos] #746genes
+##control genes are all other genes (~6,050 genes)
+#ctrl_genes <- all_cor %>% filter(ensembl_gene_id %!in% pos_genes, ensembl_gene_id %!in% neg_genes) %>% pull(., ensembl_gene_id) %>% as.character()
+#--------------
+
+## Here I abandoned pvalue cutoffs to generally define gene correlations in each dataset
+all_pos_T <-  all_cor %>% filter(type == "TCGA", cor > 0) %>% pull(., ensembl_gene_id) %>% as.character()
+all_pos_R <- all_cor %>% filter(type == "Encode", cor > 0) %>% pull(., ensembl_gene_id) %>% as.character()
+all_neg_T <- all_cor %>% filter(type == "TCGA", cor < -0.15) %>% pull(., ensembl_gene_id) %>% as.character()
+all_neg_R <- all_cor %>% filter(type == "Encode", cor < -0.15) %>% pull(., ensembl_gene_id) %>% as.character()
+all_pos <- c(all_pos_T, all_pos_R) %>% unique() #1750 genes
+all_neg <- c(all_neg_T, all_neg_R) %>% unique() #2977 genes
+
+
+##gene groups are defined by  correlation in pos/neg direction for TCGA and ENCODE (no significance)
+TCGA_pos <- all_cor %>% filter(type == "TCGA", cor > 0.15) %>% pull(., ensembl_gene_id) %>% as.character() #378
+TCGA_neg <- all_cor %>% filter(type == "TCGA", cor < -0.45) %>% pull(., ensembl_gene_id) %>% as.character() #636
+RBP_pos <- all_cor %>% filter(type == "Encode", cor > 0.15) %>% pull(., ensembl_gene_id) %>% as.character() #542
+RBP_neg <- all_cor %>% filter(type == "Encode", cor < -0.45) %>% pull(., ensembl_gene_id) %>% as.character() #387
+
+#These lists are combined and filtered for genes behaving inconsistently (~25% of pos genes, 13% of neg genes)
+pos_genes <- c(TCGA_pos, RBP_pos) %>% unique() %>% .[. %!in% all_neg] %>% .[. %!in% RBP_neg] #636 genes
+neg_genes <- c(TCGA_neg, RBP_neg) %>% unique() %>% .[. %!in% all_pos] %>% .[. %!in% RBP_pos] #809 genes
+#control genes are all other genes
+ctrl_genes <- all_cor %>% filter(ensembl_gene_id %!in% pos_genes, ensembl_gene_id %!in% neg_genes) %>% pull(., ensembl_gene_id) #5188 genes
+
+#-------------
+
+##these lists are created for easy separation of proximal and distal UTRs
+pos_prox_genes <- unlist(lapply(pos_genes, function(x) paste(x, "_uniqueUTR0", sep = "")))
+pos_dist_genes <- unlist(lapply(pos_genes, function(x) paste(x, "_uniqueUTR1", sep = "")))
+neg_prox_genes <- unlist(lapply(neg_genes, function(x) paste(x, "_uniqueUTR0", sep = "")))
+neg_dist_genes <- unlist(lapply(neg_genes, function(x) paste(x, "_uniqueUTR1", sep = "")))
+ctrl_prox_genes <- unlist(lapply(ctrl_genes, function(x) paste(x, "_uniqueUTR0", sep = "")))
+ctrl_dist_genes <- unlist(lapply(ctrl_genes, function(x) paste(x, "_uniqueUTR1", sep = "")))
+
+```
+
+## Now we can extract UTR sequences for these genes
+
+```{r, get seqs}
+##Quick function to write fastas and gffs
+export_seqs <- function(tx_list, file_name){
+  tx_gff <- exonsBy(polya_gff_txdb, "tx", use.names = TRUE)
+  tx_gff <- tx_gff[names(tx_gff) %in% tx_list]
+  seq <- extractTranscriptSeqs(Hsapiens, tx_gff)
+  writeXStringSet(seq, paste(file_name, ".fa", sep = ""), format = "fasta")
+  export(tx_gff, paste(file_name, ".gff3", sep = ""), format = "gff3")
+}
+
+#export_seqs(pos_prox_genes, "data/fastas/positive_proximal_UTRs")
+#export_seqs(pos_dist_genes, "data/fastas/positive_distal_UTRs")
+#export_seqs(neg_prox_genes, "data/fastas/negative_proximal_UTRs")
+#export_seqs(neg_dist_genes, "data/fastas/negative_distal_UTRs")
+#export_seqs(ctrl_prox_genes, "data/fastas/control_proximal_UTRs")
+#export_seqs(ctrl_dist_genes, "data/fastas/control_distal_UTRs")
+
+```
+
+```{r, read in the fastas}
+pos_prox <- readDNAStringSet("data/fastas/positive_proximal_UTRs.fa")
+pos_dist <- readDNAStringSet("data/fastas/positive_distal_UTRs.fa")
+neg_prox <- readDNAStringSet("data/fastas/negative_proximal_UTRs.fa")
+neg_dist <- readDNAStringSet("data/fastas/negative_distal_UTRs.fa")
+ctrl_prox <- readDNAStringSet("data/fastas/control_proximal_UTRs.fa")
+ctrl_dist <- readDNAStringSet("data/fastas/control_distal_UTRs.fa")
+
+```
+
+## Generally how do these groups separate?
+Ns are weird here because genes are being plotted 1-2 times for TCGA and encode on the same plots
+
+```{r, general plot redos}
+all_cor %>% 
+  mutate(selected = ifelse(ensembl_gene_id %in% substr(names(pos_prox), 1, 15), "Pos", 
+                           ifelse(ensembl_gene_id %in% substr(names(neg_prox), 1, 15), "Neg",
+                                  ifelse(ensembl_gene_id %in% substr(names(ctrl_prox), 1, 15), "Ctrl", "")))) %>%
+  filter(selected != "") %>% 
+  ggplot(aes(x = cor, y = -log(p_adj), col = selected)) + 
+  geom_point() + 
+  theme_cowplot() + 
+  guides(col = FALSE) + 
+  scale_color_manual(values = c("#cfd0e4", "#57b9be", "#e0a6f2")) +
+  labs(x = "Correlation")
+
+all_cor %>% 
+  mutate(selected = ifelse(ensembl_gene_id %in% substr(names(pos_prox), 1, 15), "Pos", 
+                           ifelse(ensembl_gene_id %in% substr(names(neg_prox), 1, 15), "Neg",
+                                  ifelse(ensembl_gene_id %in% substr(names(ctrl_prox), 1, 15), "Ctrl", "")))) %>%
+  filter(selected != "") %>% 
+  ggplot(aes(x = selected, y = cor, fill = selected)) + 
+  geom_violin() +
+  geom_boxplot(width = 0.15, outlier.alpha = FALSE) +
+  theme_cowplot() + 
+  guides(fill = FALSE) +
+  labs(x = "") +
+  scale_fill_manual(values = c("#cfd0e4", "#57b9be", "#e0a6f2")) +
+  EnvStats::stat_n_text() +
+  labs(y = "Correlation") +
+  scale_x_discrete(limits = c("Neg", "Ctrl", "Pos"), labels = c("Negatively Correlated", "Control Genes", "Positively Correlated"))
+
+all_cor %>% 
+  mutate(selected = ifelse(ensembl_gene_id %in% substr(names(pos_prox), 1, 15), "Pos", 
+                           ifelse(ensembl_gene_id %in% substr(names(neg_prox), 1, 15), "Neg",
+                                  ifelse(ensembl_gene_id %in% substr(names(ctrl_prox), 1, 15), "Ctrl", "")))) %>%
+  filter(selected != "") %>% 
+  ggplot(aes(x = selected, y = cor, fill = selected)) + 
+  geom_violin() +
+  geom_boxplot(width = 0.15, outlier.alpha = FALSE) +
+  theme_cowplot() + 
+  guides(fill = FALSE) +
+  labs(x = "") +
+  scale_fill_manual(values = c("#cfd0e4", "#57b9be", "#e0a6f2")) +
+  EnvStats::stat_n_text() +
+  labs(y = "Correlation") +
+  scale_x_discrete(limits = c("Neg", "Ctrl", "Pos"), labels = c("Negatively Correlated", "Control Genes", "Positively Correlated")) +
+  facet_grid(.~type) +
+  theme(strip.background = element_rect(color = "white", fill = "white"),
+        strip.text.x = element_text(size = 12, color = "Black", face = "bold"))
+
+all_cor %>% 
+  mutate(selected = ifelse(ensembl_gene_id %in% substr(names(pos_prox), 1, 15), "Pos", 
+                           ifelse(ensembl_gene_id %in% substr(names(neg_prox), 1, 15), "Neg",
+                                  ifelse(ensembl_gene_id %in% substr(names(ctrl_prox), 1, 15), "Ctrl", "")))) %>% dplyr::select(ensembl_gene_id, type, cor, selected) %>% 
+  spread(type, cor) %>% ggplot(aes(x = TCGA, y = Encode, col = selected, alpha = selected)) + geom_point() + theme_cowplot() + geom_smooth(method = lm, se = FALSE) + scale_color_manual(values = c("white", "#57b9be", "#cfd0e4", "#e0a6f2")) + scale_alpha_manual(values = c(0,1,1,1))
+```
+
+```{r, }
+AllCond <- read.table("data/allcondition_allgene_psiexp.txt", header = TRUE) %>% as_tibble()
+
+p <- AllCond %>%
+  mutate(type = ifelse(grepl("K562", as.character(.$sample)) | grepl("HepG2", as.character(.$sample)), "Encode", "TCGA")) %>% 
+  group_by(ensembl_gene_id, type) %>%
+  na.omit() %>% 
+  mutate(selected = ifelse(ensembl_gene_id %in% substr(names(pos_prox), 1, 15), "Pos", 
+                           ifelse(ensembl_gene_id %in% substr(names(neg_prox), 1, 15), "Neg",
+                                  ifelse(ensembl_gene_id %in% substr(names(ctrl_prox), 1, 15), "Ctrl", "")))) %>%
+  filter(selected != "")
+
+cor_val <- p %>% group_by(selected) %>% summarize(cor = round(as.numeric(cor.test(log2FC, psi, method = "spearman", exact = TRUE)[4]), digits = 3))
+
+p %>% ggplot(aes(x = psi, y = log2FC, col = selected, alpha = selected)) + 
+    geom_point() +
+    geom_smooth(aes(x = psi, y = log2FC, color = "Black"), method = lm, se = FALSE, inherit.aes = FALSE, size = 3) + 
+    geom_smooth(aes(x = psi, y = log2FC, group = selected, color = selected), method = lm, se = FALSE, inherit.aes = FALSE, size = 2) +
+    labs(title = "Differential expression and APA correlation ( )") + 
+    geom_text(aes(-0.85, 7.5, label = paste("All Genes\n","ρ = ", round(as.numeric(cor.test(p$psi, p$log2FC, method = "spearman", exact = TRUE)[4]), digits = 3), "\n", "p < ", formatC(2.2*10^-16, format = "e", digits = 1), "\nn = 2095"), col = "Black")) + 
+    #geom_text(aes(-0.85, 6.5, label = paste("pval < ", formatC(2.2*10^-16, format = "e", digits = 1)), col = "Black")) + 
+    geom_text(aes(-0.85, -8, label = paste("Control Genes\n","ρ = ", cor_val[1,2], "\n", "p < ", formatC(2.2*10^-16, format = "e", digits = 1), "\nn = 1466"), col = "#57b9be")) + 
+    #geom_text(aes(-0.85, -9, label = paste("pval < ", formatC(2.2*10^-16, format = "e", digits = 1)), col = "#cfd0e4")) + 
+    geom_text(aes(0.85, -8, label = paste("Negatively Correlated\n","ρ = ", cor_val[2,2], "\n", "p < ", formatC(2.2*10^-16, format = "e", digits = 1), "\nn = 313"), col = "#cfd0e4")) + 
+    #geom_text(aes(0.85, -9, label = paste("pval < ", formatC(2.2*10^-16, format = "e", digits = 1)), col = "#57b9be"))  + 
+    geom_text(aes(0.85, 7.5, label = paste("Positively Correlated\n","ρ = ", cor_val[3,2], "\n", "p < ", formatC(2.2*10^-16, format = "e", digits = 1), "\nn = 316"), col = "#e0a6f2")) + 
+    #geom_text(aes(0.85, 6.5, label = paste("pval < ", formatC(2.2*10^-16, format = "e", digits = 1)), col = "#e0a6f2")) +
+    theme_cowplot()  +
+    scale_color_manual(values = c("#cfd0e4", "#57b9be", "#e0a6f2","Black", "#cfd0e4", "#57b9be", "#e0a6f2"))  +
+    scale_alpha_manual(values = c(0.01,0.01,0.01)) +
+    guides(color = FALSE, alpha = FALSE) +
+    labs(x = "Δ Ψ", y = "Expression change, log2")
+
+p %>% ggplot(aes(x = psi, y = log2FC)) +
+    stat_binhex(data = subset(p, selected == "Neg"), aes(alpha = log2(..count..)), fill = "#57b9be") +
+    stat_binhex(data = subset(p, selected == "Pos"), aes(alpha = log2(..count..)), fill = "#e0a6f2") +
+    stat_binhex(data = subset(p, selected == "Ctrl"), aes(alpha = log2(..count..)), fill = "#cfd0e4") +
+    theme_cowplot()   +
+    geom_smooth(aes(x = psi, y = log2FC, color = "Black"), method = lm, se = FALSE, inherit.aes = FALSE, size = 3) + 
+    geom_smooth(aes(x = psi, y = log2FC, group = selected, color = selected), method = lm, se = FALSE, inherit.aes = FALSE, size = 2) +
+    labs(title = "Differential expression and APA correlation (ρ)") + 
+    geom_text(aes(-0.85, 7, label = paste("All Genes\n","ρ = ", round(as.numeric(cor.test(p$psi, p$log2FC, method = "spearman", exact = TRUE)[4]), digits = 3), "\n", "p < ", formatC(2.2*10^-16, format = "e", digits = 1), "\nn = 2095"), col = "Black")) + 
+    geom_text(aes(-0.85, -8, label = paste("Control Genes\n","ρ = ", cor_val[1,2], "\n", "p < ", formatC(2.2*10^-16, format = "e", digits = 1), "\nn = 1466"), col = "#57b9be")) +
+    geom_text(aes(0.85, -8, label = paste("Negatively Correlated\n","ρ = ", cor_val[2,2], "\n", "p < ", formatC(2.2*10^-16, format = "e", digits = 1), "\nn = 313"), col = "#cfd0e4")) +  
+    geom_text(aes(0.85, 7, label = paste("Positively Correlated\n","ρ = ", cor_val[3,2], "\n", "p < ", formatC(2.2*10^-16, format = "e", digits = 1), "\nn = 316"), col = "#e0a6f2")) +
+    scale_color_manual(values = c("#cfd0e4", "#57b9be", "#e0a6f2","Black", "#cfd0e4", "#57b9be", "#e0a6f2")) +
+    guides(color = FALSE, alpha = FALSE) +
+    labs(x = "Δ Ψ", y = "Expression change, log2")
+
+```
+
+```{r, length, warning = FALSE}
+#distal UTRs are much longer than proximal UTRs for positively correlated genes (this is expected)
+pos_length <- get_length(pos_prox) %>% 
+  mutate(gene = substr(gene, 1, 15)) %>% 
+  dplyr::rename("prox" = length) %>% 
+  mutate(dist = get_length(pos_dist)$length) %>% 
+  gather(-gene, key = UTR, value = length)
+
+pos_length_compare <- length_compare(pos_prox, pos_dist) %>% dplyr::rename("mean_prox" = mean_case, "mean_dist" = mean_ctrl, "prox/dist" = mean_FC)
+pos_length_compare
+
+#distal UTRs are much longer than proximal UTRs for negatively correlated genes (this is expected)
+neg_length <- get_length(neg_prox) %>% 
+  mutate(gene = substr(gene, 1, 15)) %>% 
+  dplyr::rename("prox" = length) %>% 
+  mutate(dist = get_length(neg_dist)$length) %>% 
+  gather(-gene, key = UTR, value = length)
+
+neg_length_compare <- length_compare(neg_prox, neg_dist) %>% dplyr::rename("mean_prox" = mean_case, "mean_dist" = mean_ctrl, "prox/dist" = mean_FC)
+neg_length_compare
+
+#distal UTRs are much longer than proximal UTRs for control genes (this is expected)
+ctrl_length <- get_length(ctrl_prox) %>% 
+  mutate(gene = substr(gene, 1, 15)) %>% 
+  dplyr::rename("prox" = length) %>% 
+  mutate(dist = get_length(ctrl_dist)$length) %>% 
+  gather(-gene, key = UTR, value = length)
+
+ctrl_length_compare <- length_compare(ctrl_prox, ctrl_dist) %>% dplyr::rename("mean_prox" = mean_case, "mean_dist" = mean_ctrl, "prox/dist" = mean_FC)
+ctrl_length_compare
+
+#all together now
+all_length_compare <- rbind(pos_length_compare, neg_length_compare) %>% 
+  rbind(., ctrl_length_compare) %>% 
+  as_tibble() %>% 
+  mutate(group = c("pos","neg","ctrl"))
+
+all_length_compare %>% 
+  ggplot(aes(x = group, y = CliffDelta, fill = -log(wilcox.p))) + 
+  geom_bar(stat = "identity") +
+  theme_cowplot() + 
+  scale_fill_gradient(name = "pval", trans = "log", low = "grey", high = "red", limits = c(3, -log(min(all_length_compare$wilcox.p)))) +
+  scale_x_discrete(limits=c("neg", "ctrl", "pos"), labels = c("Negatively Correlated", "Control Genes", "Positively Correlated")) + 
+  labs(title = "UTR Length", x = "", y = "Cliff's Delta \n (proximal / distal)")
+
+
+pos_length %>% 
+  dplyr::rename("Positively Correlated" = length) %>% 
+  full_join(., neg_length) %>% 
+  dplyr::rename("Negatively Correlated" = length) %>% 
+  full_join(., ctrl_length) %>% 
+  dplyr::rename("Control Genes" = length) %>% 
+  gather(-gene, - UTR, key = group, value = length) %>% 
+  ggplot(aes(x = UTR, y = length, fill = UTR)) +
+  geom_violin() +
+  EnvStats::stat_n_text(y.pos = -250) + 
+  geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+  theme_cowplot() +
+  ylim(limits = c(-500, 7500)) + 
+  facet_grid(.~factor(group, levels = c("Negatively Correlated", "Control Genes", "Positively Correlated"))) + 
+  stat_compare_means(method = "wilcox.test") +
+  guides(fill = FALSE) +
+  scale_fill_manual(values = c("#78dce8", "#fc9867")) +
+  theme(strip.background = element_rect(color = "white", fill = "white"),
+        strip.text.x = element_text(size = 12, color = "Black", face = "bold"))
+
+#whats different between pos and neg UTRs?
+#no difference in proximal UTR length
+#negatively correlated genes have much longer distal UTRs than positively correlated genes
+length_compare(pos_prox, neg_prox) %>% dplyr::rename("mean_pos" = mean_case, "mean_neg" = mean_ctrl, "pos/neg" = mean_FC)
+length_compare(pos_dist, neg_dist) %>% dplyr::rename("mean_pos" = mean_case, "mean_neg" = mean_ctrl, "pos/neg" = mean_FC)
+
+#special focus on Proximal UTRs
+#Proximal UTR length of positive and negative correlated genes do not differ from control proximal UTRs
+pos_prox_length_compare <- length_compare(pos_prox, ctrl_prox) 
+neg_prox_length_compare <- length_compare(neg_prox, ctrl_prox)
+pos_prox_length_compare %>% dplyr::rename("pos" = mean_case, "ctrl" = mean_ctrl, "pos/ctrl" = mean_FC)
+neg_prox_length_compare %>% dplyr::rename("neg" = mean_case, "ctrl" = mean_ctrl, "neg/ctrl" = mean_FC)
+
+#special focus on distal UTRs
+#positively correlated distal UTRs are shorter than expected
+#negatively correlated distal UTRS are longer than expected
+pos_dist_length_compare <- length_compare(pos_dist, ctrl_dist)
+neg_dist_length_compare <- length_compare(neg_dist, ctrl_dist)
+pos_dist_length_compare %>% dplyr::rename("pos" = mean_case, "ctrl" = mean_ctrl, "pos/ctrl" = mean_FC)
+neg_dist_length_compare %>% dplyr::rename("neg" = mean_case, "ctrl" = mean_ctrl, "neg/ctrl" = mean_FC)
+
+comp = list(c("Control Genes", "Positively Correlated"), c("Control Genes", "Negatively Correlated"))
+
+pos_length %>% 
+    dplyr::rename("Positively Correlated" = length) %>% 
+    full_join(., neg_length) %>% 
+    dplyr::rename("Negatively Correlated" = length) %>% 
+    full_join(., ctrl_length) %>% 
+    dplyr::rename("Control Genes" = length) %>% 
+    gather(-gene, - UTR, key = group, value = length) %>% 
+    ggplot(aes(x = group, y = length, fill = group)) +
+    geom_violin() + 
+    facet_wrap(.~factor(UTR, levels = c("prox", "dist"), labels = c("Proximal", "Distal")), nrow = 2) +
+    geom_boxplot(width = 0.15, outlier.alpha = FALSE) + 
+    theme_cowplot() +
+    EnvStats::stat_n_text(y.pos = -250) +
+    scale_y_continuous(limits = c(-500, 7500)) + 
+    stat_compare_means(comparisons = comp, method = "wilcox.test", label.y = c(6500, 5750)) +
+    guides(fill = FALSE) +
+    labs(x = "", title = "UTR lengths") +
+    scale_fill_manual(values = c("#cfd0e4", "#57b9be", "#e0a6f2"))  +
+  theme(strip.background = element_rect(color = "white", fill = "white"),
+        strip.text.x = element_text(size = 12, color = "Black", face = "bold")) +
+    scale_x_discrete(limits = c("Negatively Correlated", "Control Genes", "Positively Correlated"))
+
+pos_length %>% 
+    dplyr::rename("Positively Correlated" = length) %>% 
+    full_join(., neg_length) %>% 
+    dplyr::rename("Negatively Correlated" = length) %>% 
+    full_join(., ctrl_length) %>% 
+    dplyr::rename("Control Genes" = length) %>% 
+    gather(-gene, - UTR, key = group, value = length) %>% 
+    filter(UTR == "dist") %>% 
+    ggplot(aes(x = group, y = length, fill = group)) +
+    geom_violin() + 
+    geom_boxplot(width = 0.15, outlier.alpha = FALSE) + 
+    theme_cowplot() +
+    EnvStats::stat_n_text(y.pos = -250) +
+    scale_y_continuous(limits = c(-500, 7500)) + 
+    stat_compare_means(comparisons = comp, method = "wilcox.test", label.y = c(6500, 5750)) +
+    guides(fill = FALSE) +
+    labs(x = "", title = "Distal UTR lengths") +
+    scale_fill_manual(values = c("#cfd0e4", "#57b9be", "#e0a6f2"))  +
+  theme(strip.background = element_rect(color = "white", fill = "white"),
+        strip.text.x = element_text(size = 12, color = "Black", face = "bold")) +
+    scale_x_discrete(limits = c("Negatively Correlated", "Control Genes", "Positively Correlated"))
+
+UTR_length_compare <- rbind(pos_prox_length_compare, neg_prox_length_compare) %>% 
+  rbind(., pos_dist_length_compare) %>% 
+  rbind(., neg_dist_length_compare) %>% 
+  as_tibble() %>% 
+  mutate(group = c("positive_proximal", "negative_proximal", "positive_distal", "negative_distal"))
+
+UTR_length_compare %>% 
+  ggplot(aes(x = group, y = CliffDelta, fill = -log(wilcox.p))) + 
+  geom_bar(stat = "identity") +
+  theme_cowplot() + 
+  scale_fill_gradient(name = "pval", trans = "log", low = "grey", high = "red", limits = c(3, -log(min(UTR_length_compare$wilcox.p)))) +
+  scale_x_discrete(limits=c("negative_proximal", "negative_distal", "positive_proximal", "positive_distal")) + 
+  labs(title = "Length of UTRs (NR/Control)", subtitle = "", x = "", y = "Cliff's Delta \n (case / ctrl)")
+
+
+a <- pos_length %>% spread(UTR,length) %>% mutate(distvprox = dist/prox, sample = "Positively Correlated")
+b <- neg_length %>% spread(UTR,length) %>% mutate(distvprox = dist/prox, sample = "Negatively Correlated")
+c <- ctrl_length %>% spread(UTR,length) %>% mutate(distvprox = dist/prox, sample = "Control Genes")
+
+bind_rows(a,b,c) %>% 
+  ggplot(aes(x = sample, y = log2(distvprox), fill = sample)) + 
+  geom_violin() + 
+  geom_boxplot(width = 0.15, outlier.alpha = FALSE) + 
+  theme_cowplot() + 
+  stat_compare_means(comparisons = comp, method = "wilcox") + 
+  guides(fill = FALSE) +
+    labs(x = "", title = "Distal v Poximal UTR lengths") +
+    scale_fill_manual(values = c("#cfd0e4", "#57b9be", "#e0a6f2")) +
+    scale_x_discrete(limits = c("Negatively Correlated", "Control Genes", "Positively Correlated"))
+
+```
+
+## Length Summary
+Proximal UTR length does not vary.
+Distal UTRs of Positively Correlated Genes are shorter than expected while Distal UTRs of Negatively correlated genes are Longer than expected.
+
+
+```{r, GC, warning = FALSE}
+#Proximal UTRs of positively correlated genes have higher GC than distal UTRs
+pos_GC <- get_GC(pos_prox) %>% 
+  mutate(gene = substr(gene, 1, 15)) %>% 
+  dplyr::rename("prox" = GC) %>% 
+  mutate(dist = get_GC(pos_dist)$GC) %>% 
+  dplyr::select(gene, prox, dist) %>% 
+  gather(-gene, key = UTR, value = GC)
+
+pos_GC_compare <- GC_compare(pos_prox, pos_dist) %>% dplyr::rename("mean_prox" = mean_case, "mean_dist" = mean_ctrl, "prox/dist" = mean_FC)
+pos_GC_compare
+
+#no significancein GC differnce between proximal and distal UTRs of Negatively correlated genes
+neg_GC <- get_GC(neg_prox) %>% 
+  mutate(gene = substr(gene, 1, 15)) %>% 
+  dplyr::rename("prox" = GC) %>% 
+  mutate(dist = get_GC(neg_dist)$GC) %>% 
+  dplyr::select(gene, prox, dist) %>% 
+  gather(-gene, key = UTR, value = GC)
+
+neg_GC_compare <- GC_compare(neg_prox, neg_dist) %>% dplyr::rename("mean_prox" = mean_case, "mean_dist" = mean_ctrl, "prox/dist" = mean_FC)
+neg_GC_compare
+
+#proximal UTRs have higher GC content than distal UTRs for control genes 
+ctrl_GC <- get_GC(ctrl_prox) %>% 
+  mutate(gene = substr(gene, 1, 15)) %>% 
+  dplyr::rename("prox" = GC) %>% 
+  mutate(dist = get_GC(ctrl_dist)$GC) %>% 
+  dplyr::select(gene, prox, dist) %>% 
+  gather(-gene, key = UTR, value = GC)
+
+ctrl_GC_compare <- GC_compare(ctrl_prox, ctrl_dist) %>% dplyr::rename("mean_prox" = mean_case, "mean_dist" = mean_ctrl, "prox/dist" = mean_FC)
+ctrl_GC_compare
+
+#all together now
+all_GC_compare <- rbind(pos_GC_compare, neg_GC_compare) %>% 
+  rbind(., ctrl_GC_compare) %>% 
+  as_tibble() %>% 
+  mutate(group = c("pos","neg","ctrl"))
+
+all_GC_compare %>% 
+  ggplot(aes(x = group, y = CliffDelta, fill = -log(wilcox.p))) + 
+  geom_bar(stat = "identity") +
+  theme_cowplot() + 
+  scale_fill_gradient(name = "pval", trans = "log", low = "grey", high = "red", limits = c(3, -log(min(all_GC_compare$wilcox.p)))) +
+  scale_x_discrete(limits=c("neg", "ctrl", "pos"), labels = c("Negatively Correlated", "Control Genes", "Positively Correlated")) + 
+  labs(title = "GC", x = "", y = "Cliff's Delta \n (proximal / distal)")
+
+
+pos_GC %>% dplyr::rename("Positively Correlated" = GC) %>% 
+  full_join(., neg_GC) %>% 
+  dplyr::rename("Negatively Correlated" = GC) %>%
+  full_join(., ctrl_GC) %>% 
+  dplyr::rename("Control Genes" = GC) %>%
+  gather(-gene, - UTR, key = group, value = GC) %>% 
+  ggplot(aes(x = UTR, y = GC, fill = UTR)) + 
+  geom_violin() + 
+  geom_boxplot(width = 0.15, position = position_dodge(width = 0.9), outlier.alpha = FALSE) + 
+  EnvStats::stat_n_text() +
+  theme_cowplot() + 
+  facet_grid(.~factor(group, levels = c("Negatively Correlated", "Control Genes", "Positively Correlated"))) + 
+  stat_compare_means(method = "wilcox.test") + 
+  guides(fill = FALSE) +
+  scale_fill_manual(values = c("#78dce8", "#fc9867")) +
+  theme(strip.background = element_rect(color = "white", fill = "white"),
+        strip.text.x = element_text(size = 12, color = "Black", face = "bold"))
+
+#whats different between pos and neg UTRs?
+#overall proximal and distal UTRs of positively correlated genes have higher GC content than negatively correlated genes.
+GC_compare(pos_prox, neg_prox) %>% dplyr::rename("mean_pos" = mean_case, "mean_neg" = mean_ctrl, "pos/neg" = mean_FC)
+GC_compare(pos_dist, neg_dist) %>% dplyr::rename("mean_pos" = mean_case, "mean_neg" = mean_ctrl, "pos/neg" = mean_FC)
+
+#special focus on proximal UTRs
+#positively correlated proximal UTRs have higher GC content than expected
+#negatively correlated proximal UTRs have lower GC content than expected
+pos_prox_GC_compare <- GC_compare(pos_prox, ctrl_prox)
+neg_prox_GC_compare <- GC_compare(neg_prox, ctrl_prox)
+pos_prox_GC_compare %>% dplyr::rename("pos" = mean_case, "ctrl" = mean_ctrl, "pos/ctrl" = mean_FC)
+neg_prox_GC_compare %>% dplyr::rename("neg" = mean_case, "ctrl" = mean_ctrl, "neg/ctrl" = mean_FC)
+
+#special focus on distal UTRs
+#positively correlated distal UTRs have higher GC content than expected
+#negatively correlated distal UTRs have lower GC content than expected
+pos_dist_GC_compare <- GC_compare(pos_dist, ctrl_dist)
+neg_dist_GC_compare <- GC_compare(neg_dist, ctrl_dist)
+pos_dist_GC_compare %>% dplyr::rename("pos" = mean_case, "ctrl" = mean_ctrl, "pos/ctrl" = mean_FC)
+neg_dist_GC_compare %>% dplyr::rename("neg" = mean_case, "ctrl" = mean_ctrl, "neg/ctrl" = mean_FC)
+
+pos_GC %>% dplyr::rename("Positively Correlated" = GC) %>% 
+  full_join(., neg_GC) %>% 
+  dplyr::rename("Negatively Correlated" = GC) %>%
+  full_join(., ctrl_GC) %>% 
+  dplyr::rename("Control Genes" = GC) %>%
+  gather(-gene, -UTR, key = group, value = GC) %>%  
+  ggplot(aes(x = group, y = GC, fill = group)) + 
+  geom_violin() + 
+  facet_wrap(.~factor(UTR, levels = c("prox", "dist"), labels = c("Proximal", "Distal")), nrow = 2) +
+  geom_boxplot(width = 0.15, outlier.alpha = FALSE) + 
+  theme_cowplot() + 
+  stat_compare_means(comparisons = comp, method = "wilcox.test", label.y = c(0.85, 0.95)) + 
+  guides(fill = FALSE) +
+  labs(x = "", title = "UTR GC content") +
+  EnvStats::stat_n_text()  +
+  theme(strip.background = element_rect(color = "white", fill = "white"),
+        strip.text.x = element_text(size = 12, color = "Black", face = "bold")) +
+  scale_fill_manual(values = c("#cfd0e4", "#57b9be", "#e0a6f2")) +
+  scale_x_discrete(limits = c("Negatively Correlated", "Control Genes", "Positively Correlated"))
+
+pos_GC %>% dplyr::rename("Positively Correlated" = GC) %>% 
+  full_join(., neg_GC) %>% 
+  dplyr::rename("Negatively Correlated" = GC) %>%
+  full_join(., ctrl_GC) %>% 
+  dplyr::rename("Control Genes" = GC) %>%
+  gather(-gene, -UTR, key = group, value = GC) %>%  
+  filter(UTR == "dist") %>% 
+  ggplot(aes(x = group, y = GC, fill = group)) + 
+  geom_violin() + 
+  geom_boxplot(width = 0.15, outlier.alpha = FALSE) + 
+  theme_cowplot() + 
+  stat_compare_means(comparisons = comp, method = "wilcox.test", label.y = c(0.7, 0.75)) + 
+  guides(fill = FALSE) +
+  labs(x = "", title = "UTR GC content") +
+  EnvStats::stat_n_text(y.pos = 0.1)  +
+  scale_fill_manual(values = c("#cfd0e4", "#57b9be", "#e0a6f2")) +
+  scale_x_discrete(limits = c("Negatively Correlated", "Control Genes", "Positively Correlated")) +
+  ylim(0.10,0.75)
+  
+UTR_GC_compare <- rbind(pos_prox_GC_compare, neg_prox_GC_compare) %>% 
+  rbind(., pos_dist_GC_compare) %>% 
+  rbind(., neg_dist_GC_compare) %>% 
+  as_tibble() %>% 
+  mutate(group = c("positive_proximal", "negative_proximal", "positive_distal", "negative_distal"))
+
+UTR_GC_compare %>% 
+  ggplot(aes(x = group, y = CliffDelta, fill = -log(wilcox.p))) + 
+  geom_bar(stat = "identity") +
+  theme_cowplot() + 
+  scale_fill_gradient(name = "pval", trans = "log", low = "grey", high = "red", limits = c(3, -log(min(UTR_GC_compare$wilcox.p)))) +
+  scale_x_discrete(limits=c("negative_proximal", "negative_distal", "positive_proximal", "positive_distal")) + 
+  labs(title = "GC content of UTRs (NR/Control)", subtitle = "", x = "", y = "Cliff's Delta \n (case / ctrl)")
+
+a <- pos_GC %>% spread(UTR,GC) %>% mutate(distvprox = dist/prox, sample = "Positively Correlated")
+b <- neg_GC %>% spread(UTR,GC) %>% mutate(distvprox = dist/prox, sample = "Negatively Correlated")
+c <- ctrl_GC %>% spread(UTR,GC) %>% mutate(distvprox = dist/prox, sample = "Control Genes")
+
+bind_rows(a,b,c) %>% 
+  ggplot(aes(x = sample, y = log2(distvprox), fill = sample)) + 
+  geom_violin() + 
+  geom_boxplot(width = 0.15, outlier.alpha = FALSE) + 
+  theme_cowplot() + 
+  stat_compare_means(comparisons = comp, method = "wilcox") + 
+  guides(fill = FALSE) +
+    labs(x = "", title = "Distal v Poximal UTR lengths") +
+    scale_fill_manual(values = c("#cfd0e4", "#57b9be", "#e0a6f2")) +
+    scale_x_discrete(limits = c("Negatively Correlated", "Control Genes", "Positively Correlated"))
+
+```
+
+## GC Summary
+Positively Correlated Proximal and Distal UTRs are more GC rich than expected.
+While Negatively Correlated UTRs are more GC Poor than expected (both Proximal and Distal UTRs)
+
+## Kmer Content
+
+```{r, kmer}
+#kmers reflect GC content
+pos_kmer <- kmer_compare(pos_dist, pos_prox, 5) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+pos_kmer %>% dplyr::rename("dist" = case, "prox" = ctrl, "dist_freq" = case_freq, "prox_freq" = ctrl_freq, "dist_tot" = case_tot, "prox_tot" = ctrl_tot, "log2(dist/prox)" = log2FC)
+kmer_plot(pos_kmer) + ggtitle("Positively correlated genes (dist v prox)")
+
+#x <- c(1: length(pos_prox))
+#pos_kmer_list <- lapply(x, function(x) kmer_compare(pos_prox[x], pos_dist[x], 6) %>% filter(p_adj < 0.05))
+#names(pos_kmer_list) <- paste(names(pos_prox), names(pos_dist), sep = "&&")
+#pos_paired_kmer <- bind_rows(pos_kmer_list, .id = "UTR" )
+
+#kmers reflect GC content
+neg_kmer <- kmer_compare(neg_dist, neg_prox, 5) %>% mutate(p_adj = p.adjust(pval, method = "BH")) 
+neg_kmer %>% dplyr::rename("dist" = case, "prox" = ctrl, "dist_freq" = case_freq, "prox_freq" = ctrl_freq, "dist_tot" = case_tot, "prox_tot" = ctrl_tot, "log2(dist/prox)" = log2FC)
+kmer_plot(neg_kmer) + ggtitle("Negatively correlated genes (dist v prox)")
+
+#x <- c(1:length(neg_prox))
+#names(neg_kmer_list) <- paste(names(neg_prox), names(neg_dist), sep = "&&")
+#neg_paired_kmer <- bind_rows(neg_kmer_list, .id = "UTR" )
+
+#kmers reflect GC content
+ctrl_kmer <- kmer_compare(ctrl_dist, ctrl_prox,5) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+ctrl_kmer %>% dplyr::rename("dist" = case, "prox" = ctrl, "dist_freq" = case_freq, "prox_freq" = ctrl_freq, "dist_tot" = case_tot, "prox_tot" = ctrl_tot, "log2(dist/prox)" = log2FC)
+kmer_plot(ctrl_kmer) + ggtitle("Control genes (dist v prox)")
+
+###rat of rat try###
+posvctrl_kmer <- left_join(pos_kmer, ctrl_kmer, by = "kmer") %>% 
+  mutate(ctrl_freq.x = ctrl.x/sum(width(neg_prox)),
+         case_freq.x = case.x/sum(width(neg_dist)),
+         ctrl_freq.y = ctrl.y/sum(width(ctrl_prox)),
+         case_freq.y = case.y/sum(width(ctrl_dist)),
+         ror_den = log2(case_freq.x/ctrl_freq.x)-log2(case_freq.y/ctrl_freq.y),
+         ror_cts = log2(case.x/ctrl.x) - log2(case.y/ctrl.y), 
+         AT = str_count(as.character(kmer),pattern = "A|T"), 
+         AT_content = ifelse(AT == 0 | AT == 1, "0 or 1", ifelse(AT == 2 | AT == 3,  as.character(AT),"4 or 5"))) %>%
+  dplyr::select(kmer, ror_cts, ror_den, AT_content)
+
+posvctrl_kmer %>% ggplot(aes(x = ror_den, fill = AT_content)) + geom_dotplot(binwidth = 0.055) + theme_cowplot() + labs(title = "Positively Correlated", subtitle = "Density", x = "log2(pos_dist/pos_prox) - log2(ctrl_dist/ctrl_prox)")
+posvctrl_kmer %>% ggplot(aes(x = ror_cts, fill = AT_content)) + geom_dotplot(binwidth = 0.055) + theme_cowplot() + labs(title = "Positively Correlated", subtitle = "Counts", x = "log2(pos_dist/pos_prox) - log2(ctrl_dist/ctrl_prox)")
+posvctrl_kmer %>% ggplot(aes(x = ror_den, fill = AT_content, alpha = 0.5)) + geom_density() + theme_cowplot() + labs(title = "Positively Correlated", subtitle = "Density", x =  "log2(pos_dist/pos_prox) - log2(ctrl_dist/ctrl_prox)") + guides(alpha = FALSE)
+posvctrl_kmer %>% ggplot(aes(x = ror_cts, fill = AT_content, alpha = 0.5)) + geom_density() + theme_cowplot() + labs(title = "Positively Correlated", subtitle = "Counts", x =  "log2(pos_dist/pos_prox) - log2(ctrl_dist/ctrl_prox)") + guides(alpha = FALSE)
+posvctrl_kmer %>% ggplot(aes(x = ror_den, col = AT_content)) + stat_ecdf(size = 1.5, na.rm = TRUE) + theme_cowplot() + labs(title = "Positively Correlated", subtitle = "Density", x =  "log2(pos_dist/pos_prox) - log2(ctrl_dist/ctrl_prox)") + xlim(-1.75,-0.5) + scale_color_manual(values = viridis::viridis(4))
+posvctrl_kmer %>% ggplot(aes(x = ror_cts, col = AT_content)) + stat_ecdf(size = 1.5, na.rm = TRUE) + theme_cowplot() + labs(title = "Positively Correlated", subtitle = "Counts", x =  "log2(pos_dist/pos_prox) - log2(ctrl_dist/ctrl_prox)") + xlim(-1,0.5) + scale_color_manual(values = viridis::viridis(4))
+
+negvctrl_kmer <- left_join(neg_kmer, ctrl_kmer, by = "kmer") %>% 
+  mutate(ctrl_freq.x = ctrl.x/sum(width(neg_prox)),
+         case_freq.x = case.x/sum(width(neg_dist)),
+         ctrl_freq.y = ctrl.y/sum(width(ctrl_prox)),
+         case_freq.y = case.y/sum(width(ctrl_dist)),
+         ror_den = log2(case_freq.x/ctrl_freq.x)-log2(case_freq.y/ctrl_freq.y), 
+         ror_cts = log2(case.x/ctrl.x) - log2(case.y/ctrl.y), 
+         AT = str_count(as.character(kmer),pattern = "A|T"), 
+         AT_content = ifelse(AT == 0 | AT == 1, "0 or 1", ifelse(AT == 2 | AT == 3,  as.character(AT),"4 or 5"))) %>%
+  dplyr::select(kmer, ror_cts, ror_den, AT_content) 
+
+negvctrl_kmer %>% ggplot(aes(x = ror_den, fill = AT_content)) + geom_dotplot(binwidth = 0.055) + theme_cowplot() + labs(title = "Negatively Correlated", subtitle = "Density", x = "log2(neg_dist/neg_prox) - log2(ctrl_dist/ctrl_prox)")
+negvctrl_kmer %>% ggplot(aes(x = ror_cts, fill = AT_content)) + geom_dotplot(binwidth = 0.055) + theme_cowplot() + labs(title = "Negatively Correlated", subtitle = "Counts", x = "log2(neg_dist/neg_prox) - log2(ctrl_dist/ctrl_prox)")
+negvctrl_kmer %>% ggplot(aes(x = ror_den, fill = AT_content)) + geom_histogram(binwidth = 0.055) + theme_cowplot() + labs(title = "Negatively Correlated", subtitle = "Density", x = "log2(neg_dist/neg_prox) - log2(ctrl_dist/ctrl_prox)")
+negvctrl_kmer %>% ggplot(aes(x = ror_cts, fill = AT_content)) + geom_histogram(binwidth = 0.055) + theme_cowplot() + labs(title = "Negatively Correlated", subtitle = "Counts", x = "log2(neg_dist/neg_prox) - log2(ctrl_dist/ctrl_prox)")
+negvctrl_kmer %>% ggplot(aes(x = ror_den, fill = AT_content, alpha = 0.5)) + geom_density() + theme_cowplot() + labs(title = "Negatively Correlated", subtitle = "Density", x = "log2(neg_dist/neg_prox) - log2(ctrl_dist/ctrl_prox)")  + guides(alpha = FALSE)
+negvctrl_kmer %>% ggplot(aes(x = ror_cts, fill = AT_content, alpha = 0.5)) + geom_density() + theme_cowplot() + labs(title = "Negatively Correlated", subtitle = "Counts", x = "log2(neg_dist/neg_prox) - log2(ctrl_dist/ctrl_prox)")  + guides(alpha = FALSE)
+negvctrl_kmer %>% ggplot(aes(x = ror_den, col = AT_content)) + stat_ecdf(size = 1.5, na.rm = TRUE) + theme_cowplot() + labs(title = "Negatively Correlated", subtitle = "Density", x =  "log2(neg_dist/neg_prox) - log2(ctrl_dist/ctrl_prox)") + xlim(-0.5,1) + scale_color_manual(values = viridis::viridis(4))
+negvctrl_kmer %>% ggplot(aes(x = ror_cts, col = AT_content)) + stat_ecdf(size = 1.5, na.rm = TRUE) + theme_cowplot() + labs(title = "Negatively Correlated", subtitle = "Counts", x =  "log2(neg_dist/neg_prox) - log2(ctrl_dist/ctrl_prox)") + xlim(0,1.75) + scale_color_manual(values = viridis::viridis(4))
+###
+
+###Zscore###
+#posZpos_kmer <- left_join(pos_kmer, ctrl_kmer, by = "kmer") %>% mutate(ror = log2FC.x - log2FC.y, AT = str_count(as.character(kmer),pattern = "A|T")) %>% dplyr::select(kmer,log2FC.x, log2FC.y, ror, AT) %>% mutate(Z = (ror - mean(.$ror, na.rm = TRUE)) / sd(.$ror, na.rm = TRUE)) %>% filter(Z > 2) %>% pull(kmer) %>% as.character()
+#posZneg_kmer <- left_join(pos_kmer, ctrl_kmer, by = "kmer") %>% mutate(ror = log2FC.x - log2FC.y, AT = str_count(as.character(kmer),pattern = "A|T")) %>% dplyr::select(kmer,log2FC.x, log2FC.y, ror, AT) %>% mutate(Z = (ror - mean(.$ror, na.rm = TRUE)) / sd(.$ror, na.rm = TRUE)) %>% filter(Z < -2) %>% pull(kmer) %>% as.character()
+
+#kmer2logo(posZpos_kmer)
+#kmer2logo(posZneg_kmer)
+
+#negZpos_kmer <- left_join(neg_kmer, ctrl_kmer, by = "kmer") %>% mutate(ror = log2FC.x - log2FC.y, AT = str_count(as.character(kmer),pattern = "A|T")) %>% dplyr::select(kmer,log2FC.x, log2FC.y, ror, AT) %>% mutate(Z = (ror - mean(.$ror, na.rm = TRUE)) / sd(.$ror, na.rm = TRUE)) %>% filter(Z > 2) %>% pull(kmer) %>% as.character()
+#negZneg_kmer <- left_join(neg_kmer, ctrl_kmer, by = "kmer") %>% mutate(ror = log2FC.x - log2FC.y, AT = str_count(as.character(kmer),pattern = "A|T")) %>% dplyr::select(kmer,log2FC.x, log2FC.y, ror, AT) %>% mutate(Z = (ror - mean(.$ror, na.rm = TRUE)) / sd(.$ror, na.rm = TRUE)) %>% filter(Z < -2) %>% pull(kmer) %>% as.character()
+
+#kmer2logo(negZpos_kmer)
+#kmer2logo(negZneg_kmer)
+###
+
+###BRESLOWDAY###
+library(DescTools)
+contingency_cube <- function(case.x, case_tot.x, ctrl.x, ctrl_tot.x, case.y, case_tot.y, ctrl.y, ctrl_tot.y){
+  cube <- array(
+      c(case.x, case_tot.x, ctrl.x, ctrl_tot.x, case.y, case_tot.y, ctrl.y, ctrl_tot.y),
+      dim=c(2, 2, 2),
+      dimnames=list(counts = c("counts", "tot"),
+                    UTR = c("dist", "prox"),
+                    gene_sets  = c("case", "ctrl"))
+                    )
+}
+
+
+BDT_pos_kmer <- left_join(pos_kmer, ctrl_kmer, by = "kmer") %>% 
+  mutate(ctrl_freq.x = ctrl.x/sum(width(neg_prox)),
+         case_freq.x = case.x/sum(width(neg_dist)),
+         ctrl_freq.y = ctrl.y/sum(width(ctrl_prox)),
+         case_freq.y = case.y/sum(width(ctrl_dist)),
+         ror_den = log2(case_freq.x/ctrl_freq.x)-log2(case_freq.y/ctrl_freq.y), 
+         ror_cts = log2(case.x/ctrl.x) - log2(case.y/ctrl.y), 
+         distvctrl = log2(case.x/case.y),
+         AT = str_count(as.character(kmer), pattern = "A|T"), 
+         BDT_pval_cts = BreslowDayTest(contingency_cube(case.x, case_tot.x, ctrl.x, ctrl_tot.x, case.y, case_tot.y, ctrl.y, ctrl_tot.y))[[3]]) %>% 
+         #BDT_pval_den = BreslowDayTest(contingency_cube(case_freq.x, 1, ctrl_freq.x, 1, case_freq.y, 1, ctrl_freq.y, 1))[[3]]) %>%
+  ungroup() %>% 
+  mutate(BDT_padj_cts = p.adjust(.$BDT_pval_cts, method = "BH")) %>% 
+         #BDT_padj_den = p.adjust(.$BDT_pval_den, method = "BH")) %>%
+  dplyr::select(kmer,distvctrl, ror_den, ror_cts, BDT_pval_cts, BDT_padj_cts, AT) %>% 
+  arrange(BDT_padj_cts)
+
+p <- BDT_pos_kmer %>% mutate(sig = ifelse(BDT_padj_cts < 0.05, "< 0.05", "ns"))
+p %>% ggplot(aes(x = ror_cts, y = -log(BDT_padj_cts), col = sig, alpha = sig)) +
+  geom_point() + 
+  scale_color_manual(values = c("Red", "Black")) +
+  scale_alpha_manual(values = c(1,0.1)) +
+  geom_text(data = subset(p, sig == "< 0.05"), aes(label = kmer), nudge_y = 0.5) +
+  theme_cowplot() +
+  labs(title = "Positively Correlated (BDT)", subtitle = "Counts", x = "log2(pos_dist/pos_prox) - log2(ctrl_dist/ctrl_prox)")
+
+BDT_neg_kmer <- left_join(neg_kmer, ctrl_kmer, by = "kmer") %>% 
+  mutate(ctrl_freq.x = ctrl.x/sum(width(neg_prox)),
+         case_freq.x = case.x/sum(width(neg_dist)),
+         ctrl_freq.y = ctrl.y/sum(width(ctrl_prox)),
+         case_freq.y = case.y/sum(width(ctrl_dist)),
+         ror_den = log2(case_freq.x/ctrl_freq.x)-log2(case_freq.y/ctrl_freq.y), 
+         ror_cts = log2(case.x/ctrl.x) - log2(case.y/ctrl.y),
+         distvctrl = log2(case.x/case.y),
+         AT = str_count(as.character(kmer), pattern = "A|T"), 
+         BDT_pval_cts = BreslowDayTest(contingency_cube(case.x, case_tot.x, ctrl.x, ctrl_tot.x, case.y, case_tot.y, ctrl.y, ctrl_tot.y))[[3]]) %>% 
+         #BDT_pval_den = BreslowDayTest(contingency_cube(case_freq.x, case_tot.x/sum(width(neg_dist)), ctrl_freq.x, ctrl_tot.x/sum(width(neg_prox)), case_freq.y, case_tot.y/sum(width(ctrl_dist)), ctrl_freq.y, ctrl_tot.y/sum(width(ctrl_prox))))[[3]]) %>%
+  ungroup() %>% 
+  mutate(BDT_padj_cts = p.adjust(BDT_pval_cts, method = "BH")) %>% 
+         #BDT_padj_den = p.adjust(BDT_pval_den, method = "BH")) %>%
+  dplyr::select(kmer,distvctrl, ror_den, ror_cts, BDT_pval_cts, BDT_padj_cts, AT) %>% 
+  arrange(BDT_padj_cts)
+
+p <- BDT_neg_kmer %>% mutate(sig = ifelse(BDT_padj_cts < 0.05, "< 0.05", "ns"))
+p %>% ggplot(aes(x = ror_cts, y = -log(BDT_padj_cts), col = sig, alpha = sig)) +
+  geom_point() + 
+  scale_color_manual(values = c("Red", "Black")) +
+  scale_alpha_manual(values = c(1,0.1)) +
+  geom_text(data = subset(p, sig == "< 0.05"), aes(label = kmer), nudge_y = 0.5) +
+  theme_cowplot() +
+  labs(title = "Negatively Correlated (BDT)", x = "log2(neg_dist/neg_prox) - log2(ctrl_dist/ctrl_prox)")
+
+p <- left_join(BDT_pos_kmer, BDT_neg_kmer, by = "kmer") %>% 
+  mutate(AT_content = ifelse(AT.x == 0 | AT.x == 1, "0 or 1", 
+                             ifelse(AT.x == 2 | AT.x == 3,  as.character(AT.x),"4 or 5")),
+         sig = ifelse(BDT_padj_cts.y < 0.05 & BDT_padj_cts.x < 0.05, "2", ifelse(BDT_padj_cts.y < 0.05 | BDT_padj_cts.x < 0.05, "1", "0")),
+         labeled = ifelse(sig == 1, T, F))
+  
+p %>% ggplot(aes(x = ror_cts.y, y = ror_cts.x, label = kmer)) + 
+  geom_point(aes(col = AT_content, shape = sig, size = sig)) + 
+  theme_cowplot() +
+  labs(x = "log2(neg_dist/neg_prox) - log2(ctrl_dist/ctrl_prox)", 
+       y = "log2(pos_dist/pos_prox) - log2(ctrl_dist/ctrl_prox)",
+       title = "kmer enrichment", subtitle = "Counts") +
+  scale_color_manual(values = viridis::viridis(4)) +
+  scale_shape_manual(values = c(20, 1, 10)) +
+  scale_size_manual(values = c(1, 3, 3)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  ggrepel::geom_text_repel(data = subset(p, labeled == "TRUE"), nudge_y = 0.025, col = "Black")
+
+p <- left_join(BDT_pos_kmer, BDT_neg_kmer, by = "kmer") %>% 
+  mutate(AT_content = ifelse(AT.x == 0 | AT.x == 1, "0 or 1", ifelse(AT.x == 2 | AT.x == 3,  as.character(AT.x),"4 or 5")),
+         sig = ifelse(BDT_padj_cts.y < 0.05 & BDT_padj_cts.x < 0.05, "2", ifelse(BDT_padj_cts.y < 0.05 | BDT_padj_cts.x < 0.05, "1", "0")),
+         labeled = ifelse(sig == 1, T, F))
+
+p %>% ggplot(aes(x = ror_den.y, y = ror_den.x, label = kmer)) + 
+  geom_point(aes(col = AT_content, shape = sig, size = sig)) + 
+  theme_cowplot() +
+  labs(x = "log2(neg_dist/neg_prox) - log2(ctrl_dist/ctrl_prox)", 
+       y = "log2(pos_dist/pos_prox) - log2(ctrl_dist/ctrl_prox)",
+       title = "kmer enrichment", subtitle = "Density") +
+  scale_color_manual(values = viridis::viridis(4)) +
+  scale_shape_manual(values = c(20, 1, 10)) +
+  scale_size_manual(values = c(1, 3, 3)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed")  +
+  ggrepel::geom_text_repel(data = subset(p, labeled == "TRUE"), nudge_y = 0.025, col = "Black")
+
+left_join(BDT_pos_kmer, BDT_neg_kmer, by = "kmer") %>% 
+  mutate(sig = ifelse(BDT_padj_cts.y < 0.05 & BDT_padj_cts.x < 0.05, "2", ifelse(BDT_padj_cts.y < 0.05 | BDT_padj_cts.x < 0.05, "1", "0"))) %>% filter(sig == 2, (ror_cts.y < 0 & ror_cts.x > 0) | (ror_cts.y > 0 & ror_cts.x < 0)) %>% arrange(ror_cts.y)
+
+
+###
+
+#whats different between pos and neg UTRs?
+#This also reflects GC content (pos more GC than neg)...
+posvneg_prox_kmer <- kmer_compare(pos_prox, neg_prox, 5) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+posvneg_prox_kmer %>% dplyr::rename("neg" = ctrl, "pos" = case,"neg_freq" = ctrl_freq, "pos_freq" = case_freq, "neg_tot" = ctrl_tot, "pos_tot" = case_tot, "log2(prox/dist)" = log2FC)
+kmer_plot(posvneg_prox_kmer) + ggtitle("Positive vs Negative correlated Proximal UTRs") + labs(x = "log2(pos/neg)")
+
+posvneg_dist_kmer <- kmer_compare(pos_dist, neg_dist, 5) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+posvneg_dist_kmer %>% dplyr::rename("neg" = ctrl, "pos" = case, "neg_freq" = ctrl_freq, "pos_freq" = case_freq, "neg_tot" = ctrl_tot, "pos_tot" = case_tot, "log2(prox/dist)" = log2FC)
+kmer_plot(posvneg_dist_kmer) + ggtitle("Positive vs Negative correlated Distal UTRs") + labs(x = "log2(pos/neg)")
+
+#special focus on proximal UTRs
+#positively correlated proximal UTRs have more GC kmers than expected
+#negatively correlated proximal UTRs have more AT kmers than expected
+posvctrl_prox_kmer <- kmer_compare(pos_prox, ctrl_prox, 5) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+posvctrl_prox_kmer %>% dplyr::rename("pos" = case, "pos_freq" = case_freq, "pos_tot" = case_tot, "log2(prox/dist)" = log2FC)
+kmer_plot(posvctrl_prox_kmer) + ggtitle("Positive vs Control Proximal UTRs") + labs(x = "log2(pos/ctrl)")
+
+negvctrl_prox_kmer <- kmer_compare(neg_prox, ctrl_prox, 5) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+negvctrl_prox_kmer %>% dplyr::rename("neg" = case, "neg_freq" = case_freq, "neg_tot" = case_tot, "log2(prox/dist)" = log2FC)
+kmer_plot(negvctrl_prox_kmer) + ggtitle("Negative vs Control Proximal UTRs") + labs(x = "log2(neg/ctrl)")
+
+#special focus on distal UTRs
+#positively correlated distal UTRs have more GC kmers than expected
+#negatively correlated distal UTRs have more AT kmers than expected
+posvctrl_dist_kmer <- kmer_compare(pos_dist, ctrl_dist, 5) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+posvctrl_dist_kmer %>% dplyr::rename("pos" = case, "pos_freq" = case_freq, "pos_tot" = case_tot, "log2(prox/dist)" = log2FC)
+kmer_plot(posvctrl_dist_kmer) + ggtitle("Positive vs Control Distal UTRs") + labs(x = "log2(pos/ctrl)")
+
+negvctrl_dist_kmer <- kmer_compare(neg_dist, ctrl_dist, 5) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+negvctrl_dist_kmer %>% dplyr::rename("neg" = case, "neg_freq" = case_freq, "neg_tot" = case_tot, "log2(prox/dist)" = log2FC)
+kmer_plot(negvctrl_dist_kmer) + ggtitle("Negative vs Control Distal UTRs") + labs(x = "log2(neg/ctrl)")
+
+##Just distal
+p <- left_join(posvctrl_dist_kmer, negvctrl_dist_kmer, by = "kmer") %>% 
+  mutate(kmer = gsub("T", "U", kmer),
+         ctrl_freq.x = ctrl.x/sum(width(ctrl_dist)),
+         case_freq.x = case.x/sum(width(pos_dist)),
+         ctrl_freq.y = ctrl.y/sum(width(ctrl_dist)),
+         case_freq.y = case.y/sum(width(neg_dist)),
+         AT = str_count(as.character(kmer),pattern = "A|U"),
+         AU_content = ifelse(AT == 0 | AT == 1, "0 or 1", ifelse(AT == 2 | AT == 3,  as.character(AT),"4 or 5")),
+         sig = ifelse(p_adj.y < 0.05 & p_adj.x < 0.05, "2", ifelse(p_adj.y < 0.05 | p_adj.x < 0.05, "1", "0")),
+         #labeled = ifelse(sig == 2, T, F),
+         labeled = ifelse(kmer == "AUUUA", T, F))
+
+p %>% ggplot(aes(x = log2(case_freq.y/ctrl_freq.y), y = log2(case_freq.x/ctrl_freq.x), label = kmer)) + 
+  geom_point(aes(col = AU_content, shape = sig, size = sig)) + 
+  theme_cowplot() +
+  labs(x = "5-mer Enrichment, log2(Negative / Control)", 
+       y = "5-mer Enrichment, log2(Positive / Control)",
+       title = "5-mer Distal UTR enrichment") +
+  scale_color_manual(values = viridis::viridis(4)) +
+  scale_shape_manual(values = c(20, 1, 10)) +
+  scale_size_manual(values = c(1, 3, 3)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed")  +
+  ggrepel::geom_text_repel(data = subset(p, labeled == "TRUE"), nudge_y = 0.025, col = "Black")
+
+p %>% ggplot(aes(x = log2(case_freq.x/ctrl_freq.x), col = AU_content)) + stat_ecdf(size = 1.5, na.rm = TRUE) + theme_cowplot() + labs(title = "Positively Correlated Distal UTR", y = "Fraction of 5-mers", x =  "5-mer Enrichment, log2(Positive / Control)") + xlim(-0.5,0.5) + scale_color_manual(values = viridis::viridis(4))
+p %>% ggplot(aes(x = log2(case_freq.y/ctrl_freq.y), col = AU_content)) + stat_ecdf(size = 1.5, na.rm = TRUE) + theme_cowplot() + labs(title = "Negatively Correlated Distal UTR", y = "Fraction of 5-mers", x = "5-mer Enrichment, log2(Negative / Control)") + scale_color_manual(values = viridis::viridis(4)) + scale_x_continuous(limits = c(-0.8,0.4),breaks = c(-0.75,-0.5,-0.25,0,0.25))
+
+
+p <- left_join(posvctrl_prox_kmer, negvctrl_prox_kmer, by = "kmer") %>% 
+  mutate(ctrl_freq.x = ctrl.x/sum(width(ctrl_prox)),
+         case_freq.x = case.x/sum(width(pos_prox)),
+         ctrl_freq.y = ctrl.y/sum(width(ctrl_prox)),
+         case_freq.y = case.y/sum(width(neg_prox)),
+         AT = str_count(as.character(kmer),pattern = "A|T"),
+         AT_content = ifelse(AT == 0 | AT == 1, "0 or 1", ifelse(AT == 2 | AT == 3,  as.character(AT),"4 or 5")),
+         sig = ifelse(p_adj.y < 0.05 & p_adj.x < 0.05, "2", ifelse(p_adj.y < 0.05 | p_adj.x < 0.05, "1", "0")),
+         labeled = ifelse(sig == 2, T, F))
+
+p %>% ggplot(aes(x = log2(case_freq.y/ctrl_freq.y), y = log2(case_freq.x/ctrl_freq.x), label = kmer)) + 
+  geom_point(aes(col = AT_content, shape = sig, size = sig)) + 
+  theme_cowplot() +
+  labs(x = "log2(neg_prox/ctrl_prox)", 
+       y = "log2(pos_prox/ctrl_prox)",
+       title = "kmer Proximal UTR enrichment", subtitle = "Density") +
+  scale_color_manual(values = viridis::viridis(4)) +
+  scale_shape_manual(values = c(20, 1, 10)) +
+  scale_size_manual(values = c(1, 3, 3)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed")  +
+  ggrepel::geom_text_repel(data = subset(p, labeled == "TRUE"), nudge_y = 0.025, col = "Black")
+
+```
+
+## Kmer Summary
+
+```{r, }
+#kmer2PWM(posvctrl_prox_kmer %>% filter(log2FC > 0, p_adj < 0.05) %>% pull(kmer)) %>% ggseqlogo::ggseqlogo(method = "prob") + ggtitle("Kmers enriched in Positively correlated proximal UTRs") + ggtitle("Kmers enriched in Positively correlated proximal UTRs")
+universalmotif::create_motif(posvctrl_prox_kmer %>% filter(log2FC > 0, p_adj < 0.05) %>% pull(kmer) %>% as.character(), type = "PPM")["motif"] %>% ggseqlogo::ggseqlogo(method = "prob") + ggtitle("Kmers enriched in Positively correlated proximal UTRs")
+kmer2logo(negvctrl_prox_kmer %>% filter(log2FC > 0, p_adj < 0.05) %>% pull(kmer), "Kmers enriched in Negatively correlated proximal UTRs")
+kmer2logo(posvctrl_dist_kmer %>% filter(log2FC > 0, p_adj < 0.05) %>% pull(kmer), "Kmers enriched in Positively correlated distal UTRs")
+kmer2logo(negvctrl_dist_kmer %>% filter(log2FC > 0, p_adj < 0.05) %>% pull(kmer), "Kmers enriched in Negatively correlated distal UTRs")
+#kmer2PWM(posvctrl_prox_kmer %>% filter(log2FC < 0, p_adj < 0.05) %>% pull(kmer)) %>% ggseqlogo::ggseqlogo(method = "prob") + ggtitle("Kmers depleted in Positively correlated proximal UTRs")
+list(universalmotif::create_motif(posvctrl_prox_kmer %>% filter(log2FC < 0, p_adj < 0.05) %>% pull(kmer) %>% as.character() %>% .[1], type = "PPM")["motif"], universalmotif::create_motif(posvctrl_prox_kmer %>% filter(log2FC < 0, p_adj < 0.05) %>% pull(kmer) %>% as.character() %>% .[2], type = "PPM")["motif"]) %>% ggseqlogo::ggseqlogo(method = "prob") + ggtitle("Kmers depleted in Positively correlated proximal UTRs")
+kmer2logo(negvctrl_prox_kmer %>% filter(log2FC < 0, p_adj < 0.05) %>% pull(kmer), "Kmers depleted in Negatively correlated proximal UTRs")
+#kmer2PWM(posvctrl_dist_kmer %>% filter(log2FC < 0, p_adj < 0.05) %>% pull(kmer)) %>% ggseqlogo::ggseqlogo(method = "prob") + ggtitle("Kmers depleted in Positively correlated distal UTRs")
+universalmotif::create_motif(posvctrl_dist_kmer %>% filter(log2FC < 0, p_adj < 0.05) %>% pull(kmer) %>% as.character(), type = "PPM")["motif"] %>% ggseqlogo::ggseqlogo(method = "prob") + ggtitle("Kmers depleted in Positively correlated distal UTRs")
+kmer2logo(negvctrl_dist_kmer %>% filter(log2FC < 0, p_adj < 0.05) %>% pull(kmer), "Kmers depleted in Negatively correlated distal UTRs")
+
+```
+
+## RBP Motifs
+
+```{r, CisbpRNA Scanning}
+#PCBP4 and RBMX comes out with a few others
+#pos_motif <- motif_compare(CISBPRNA_hs_PWM, pos_prox, pos_dist) 
+#write.table(pos_motif, "data/cisbpRNAposUTRcompare.txt")
+pos_motif <- as_tibble(read.table("data/cisbpRNAposUTRcompare.txt", header = TRUE)) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+pos_motif %>% dplyr::rename("dist" = ctrl, "prox" = case, "dist_freq" = ctrl_freq, "prox_freq" = case_freq, "dist_tot" = ctrl_tot, "prox_tot" = case_tot, "log2(prox/dist)" = log2FC) #9s
+pos_motif %>% mutate(motif = substr(motif,10, nchar(as.character(motif)))) %>% motif_plot() + ggtitle("Positive Correlated Genes") + labs(x = "log2(prox/dist)")
+
+#
+#neg_motif <- motif_compare(CISBPRNA_hs_PWM, neg_prox, neg_dist)
+#write.table(neg_motif, "data/cisbpRNAnegUTRcompare.txt")
+neg_motif <- as_tibble(read.table("data/cisbpRNAnegUTRcompare.txt", header = TRUE)) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+neg_motif %>% dplyr::rename("dist" = ctrl, "prox" = case, "dist_freq" = ctrl_freq, "prox_freq" = case_freq, "dist_tot" = ctrl_tot, "prox_tot" = case_tot, "log2(prox/dist)" = log2FC) #90s
+neg_motif %>% mutate(motif = substr(motif,10, nchar(as.character(motif)))) %>% motif_plot() + ggtitle( "Negative Correlated Genes") + labs(x = "log2(prox/dist)")
+
+#
+#ctrl_motif <- motif_compare(CISBPRNA_hs_PWM, ctrl_prox, ctrl_dist)
+#write.table(ctrl_motif, "data/cisbpRNAcontrolUTRcompare.txt")
+ctrl_motif <- as_tibble(read.table("data/cisbpRNAcontrolUTRcompare.txt", header = TRUE)) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+ctrl_motif %>% dplyr::rename("dist" = ctrl, "prox" = case, "dist_freq" = ctrl_freq, "prox_freq" = case_freq, "dist_tot" = ctrl_tot, "prox_tot" = case_tot, "log2(prox/dist)" = log2FC) #9min
+ctrl_motif %>% mutate(motif = substr(motif,10, nchar(as.character(motif)))) %>% motif_plot() + ggtitle("Control Genes") + labs(x = "log2(prox/dist)")
+
+
+#dist/prox
+#pos_distvprox_motif <- motif_compare(CISBPRNA_hs_PWM, pos_dist, pos_prox) 
+#write.table(pos_distvprox_motif, "data/cisbpRNApos_distvprox_compare.txt")
+pos_distvprox_motif <- as_tibble(read.table("data/cisbpRNApos_distvprox_compare.txt", header = TRUE)) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+pos_distvprox_motif %>% dplyr::rename("dist" = case, "prox" = ctrl, "dist_freq" = case_freq, "prox_freq" = ctrl_freq, "dist_tot" = case_tot, "prox_tot" = ctrl_tot, "log2(dist/prox)" = log2FC) #9s
+pos_distvprox_motif %>% mutate(motif = substr(motif,10, nchar(as.character(motif)))) %>% motif_plot() + ggtitle("Positive Correlated Genes") + labs(x = "log2(dist/prox)")
+
+#
+#neg_distvprox_motif <- motif_compare(CISBPRNA_hs_PWM, neg_dist, neg_prox)
+#write.table(neg_distvprox_motif, "data/cisbpRNAneg_distvprox_compare.txt")
+neg_distvprox_motif <- as_tibble(read.table("data/cisbpRNAneg_distvprox_compare.txt", header = TRUE)) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+neg_distvprox_motif %>% dplyr::rename("dist" = case, "prox" = ctrl, "dist_freq" = case_freq, "prox_freq" = ctrl_freq, "dist_tot" = case_tot, "prox_tot" = ctrl_tot, "log2(dist/prox)" = log2FC) #90s
+neg_distvprox_motif %>% mutate(motif = substr(motif,10, nchar(as.character(motif)))) %>% motif_plot() + ggtitle( "Negative Correlated Genes") + labs(x = "log2(dist/prox)")
+
+#
+#ctrl_distvprox_motif <- motif_compare(CISBPRNA_hs_PWM, ctrl_dist, ctrl_prox)
+#write.table(ctrl_distvprox_motif, "data/cisbpRNAcontrol_distvprox_compare.txt")
+ctrl_distvprox_motif <- as_tibble(read.table("data/cisbpRNAcontrol_distvprox_compare.txt", header = TRUE)) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+ctrl_distvprox_motif %>% dplyr::rename("dist" = case, "prox" = ctrl, "dist_freq" = case_freq, "prox_freq" = ctrl_freq, "dist_tot" = case_tot, "prox_tot" = ctrl_tot, "log2(dist/prox)" = log2FC) #9min
+ctrl_distvprox_motif %>% mutate(motif = substr(motif,10, nchar(as.character(motif)))) %>% motif_plot() + ggtitle("Control Genes") + labs(x = "log2(dist/prox)")
+
+###BRESLOWDAY###
+
+BDT_pos_motif <- left_join(pos_distvprox_motif, ctrl_distvprox_motif, by = "motif") %>% 
+  na.omit() %>% 
+  rowwise() %>% 
+  mutate(ctrl_freq.x = ctrl.x/sum(width(pos_prox)),
+         case_freq.x = case.x/sum(width(pos_dist)),
+         ctrl_freq.y = ctrl.y/sum(width(ctrl_prox)),
+         case_freq.y = case.y/sum(width(ctrl_dist)),
+         ror_den = log2(case_freq.x/ctrl_freq.x)-log2(case_freq.y/ctrl_freq.y),
+         ror_cts = log2(case.x/ctrl.x) - log2(case.y/ctrl.y), 
+         ror_dvp = log2(case_freq.x / case_freq.y) - log2(ctrl_freq.x/ctrl_freq.y),
+         BDT_pval_cts = BreslowDayTest(contingency_cube(as.numeric(case.x), as.numeric(case_tot.x), as.numeric(ctrl.x), as.numeric(ctrl_tot.x), as.numeric(case.y), as.numeric(case_tot.y), as.numeric(ctrl.y), as.numeric(ctrl_tot.y)))[[3]]) %>% 
+  ungroup() %>% 
+  mutate(BDT_padj_cts = p.adjust(.$BDT_pval_cts, method = "BH")) %>%
+  dplyr::select(motif, ror_den, ror_cts,ror_dvp, BDT_pval_cts, BDT_padj_cts) %>% 
+  arrange(BDT_padj_cts)
+
+p <- BDT_pos_motif %>% mutate(sig = ifelse(BDT_padj_cts < 0.05, "< 0.05", "ns")) %>% mutate(RBP = substr(motif,10, nchar(as.character(motif))))
+p %>% ggplot(aes(x = ror_cts, y = -log(BDT_padj_cts), col = sig, alpha = sig)) +
+  geom_point() + 
+  scale_color_manual(values = c("Red", "Black")) +
+  scale_alpha_manual(values = c(1,0.1)) +
+  geom_text(data = subset(p, sig == "< 0.05"), aes(label = RBP), nudge_y = 0.5) +
+  theme_cowplot() +
+  labs(x = "log2(pos_dist/pos_prox) - log2(ctrl_dist/ctrl_prox)", title = "BreslowDay Positive Dist/Prox", subtitle = "Counts")
+
+BDT_neg_motif <- left_join(neg_distvprox_motif, ctrl_distvprox_motif, by = "motif") %>% 
+  na.omit() %>% 
+  rowwise() %>% 
+  mutate(ctrl_freq.x = ctrl.x/sum(width(neg_prox)),
+         case_freq.x = case.x/sum(width(neg_dist)),
+         ctrl_freq.y = ctrl.y/sum(width(ctrl_prox)),
+         case_freq.y = case.y/sum(width(ctrl_dist)),
+         ror_den = log2(case_freq.x/ctrl_freq.x) - log2(case_freq.y/ctrl_freq.y),
+         ror_cts = log2(case.x/ctrl.x) - log2(case.y/ctrl.y), 
+         ror_dvp = log2(case_freq.x / case_freq.y) - log2(ctrl_freq.x/ctrl_freq.y),
+         BDT_pval_cts = BreslowDayTest(contingency_cube(as.numeric(case.x), as.numeric(case_tot.x), as.numeric(ctrl.x), as.numeric(ctrl_tot.x), as.numeric(case.y), as.numeric(case_tot.y), as.numeric(ctrl.y), as.numeric(ctrl_tot.y)))[[3]]) %>% 
+  ungroup() %>% 
+  mutate(BDT_padj_cts = p.adjust(.$BDT_pval_cts, method = "BH")) %>%
+  dplyr::select(motif, ror_den,ror_dvp, ror_cts, BDT_pval_cts, BDT_padj_cts) %>% 
+  arrange(BDT_padj_cts)
+
+p <- BDT_neg_motif %>% mutate(sig = ifelse(BDT_padj_cts < 0.05, "< 0.05", "ns")) %>% mutate(RBP = substr(motif,10, nchar(as.character(motif))))
+p %>% ggplot(aes(x = ror_cts, y = -log(BDT_padj_cts), col = sig, alpha = sig)) +
+  geom_point() + 
+  scale_color_manual(values = c("Red", "Black")) +
+  scale_alpha_manual(values = c(1,0.1)) +
+  ggrepel::geom_text_repel(data = subset(p, sig == "< 0.05"), aes(label = RBP), nudge_y = 0.5) +
+  theme_cowplot() +
+  labs(x = "log2(neg_dist/neg_prox) - log2(ctrl_dist/ctrl_prox)", title = "BreslowDay Negative Dist/Prox", subtitle = "Counts")
+
+
+p <- left_join(BDT_pos_motif, BDT_neg_motif, by = "motif") %>% 
+  mutate(sig = ifelse(BDT_padj_cts.y < 0.05 & BDT_padj_cts.x < 0.05, "2", ifelse(BDT_padj_cts.y < 0.05 | BDT_padj_cts.x < 0.05, "1", "0")),
+         RBP = substr(motif, 10, nchar(as.character(motif))),
+         labeled = ifelse(sig == 1 & ((ror_cts.y < 0 & ror_cts.x > 0) | (ror_cts.y > 0 & ror_cts.x < 0)), T, F)) 
+p %>%
+  ggplot(aes(x = ror_cts.y, y = ror_cts.x)) + 
+  geom_point(aes(shape = sig, col = sig, size = sig)) + 
+  theme_cowplot() +
+  labs(x = "log2(neg_dist/neg_prox) - log2(ctrl_dist/ctrl_prox)", 
+       y = "log2(pos_dist/pos_prox) - log2(ctrl_dist/ctrl_prox)",
+       title = "CisbpRNA enrichment",
+       subtitle = "Counts") +
+  scale_color_manual(values = c("black", "#2D708EFF", "#3CBB75FF")) +
+  scale_shape_manual(values = c(20, 1, 10)) +
+  scale_size_manual(values = c(1, 3, 3)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  ggrepel::geom_text_repel(data = subset(p, labeled == "TRUE"), aes(label = RBP), nudge_y = 0.025, col = "#2D708EFF")
+
+p %>%
+  ggplot(aes(x = ror_den.y, y = ror_den.x)) + 
+  geom_point(aes(shape = sig, col = sig, size = sig)) + 
+  theme_cowplot() +
+  labs(x = "log2(neg_dist/neg_prox) - log2(ctrl_dist/ctrl_prox)", 
+       y = "log2(pos_dist/pos_prox) - log2(ctrl_dist/ctrl_prox)",
+       title = "CisbpRNA enrichment",
+       subtitle = "Density") +
+  scale_color_manual(values = c("black", "#2D708EFF", "#3CBB75FF")) +
+  scale_shape_manual(values = c(20, 1, 10)) +
+  scale_size_manual(values = c(1, 3, 3)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  ggrepel::geom_text_repel(data = subset(p, labeled == "TRUE"), aes(label = RBP), nudge_y = 0.025, col = "#2D708EFF")
+
+p <- left_join(BDT_pos_motif, BDT_neg_motif, by = "motif") %>% 
+  mutate(sig = ifelse(BDT_padj_cts.y < 0.05 & BDT_padj_cts.x < 0.05, "2", ifelse(BDT_padj_cts.y < 0.05 | BDT_padj_cts.x < 0.05, "1", "0")),
+         RBP = substr(motif, 10, nchar(as.character(motif))), labeled = ifelse(grepl(x = RBP, pattern = "ELAVL"), T, F)) 
+p %>%
+  ggplot(aes(x = ror_cts.y, y = ror_cts.x, label = RBP)) + 
+  geom_point(aes(shape = sig, col = sig, size = sig)) + 
+  theme_cowplot() +
+  labs(x = "log2(neg_dist/neg_prox) - log2(ctrl_dist/ctrl_prox)", 
+       y = "log2(pos_dist/pos_prox) - log2(ctrl_dist/ctrl_prox)",
+       title = "cisbpRNA enrichment") +
+  scale_color_manual(values = c("black", "#2D708EFF", "#3CBB75FF")) +
+  scale_shape_manual(values = c(20, 1, 10)) +
+  scale_size_manual(values = c(1, 3, 3)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_text_repel(data = subset(p, labeled == "TRUE"), nudge_y = 0.025, col = "Black")
+
+
+
+
+left_join(BDT_pos_motif, BDT_neg_motif, by = "motif") %>% 
+  mutate(sig = ifelse(BDT_padj_cts.y < 0.05 & BDT_padj_cts.x < 0.05, "2", ifelse(BDT_padj_cts.y < 0.05 | BDT_padj_cts.x < 0.05, "1", "0"))) %>% filter(sig == 1, (ror_cts.y < 0 & ror_cts.x > 0) | (ror_cts.y > 0 & ror_cts.x < 0)) %>% arrange(ror_cts.y)
+
+
+###
+
+###Zscores?
+left_join(pos_distvprox_motif, ctrl_distvprox_motif, by = "motif") %>% 
+  na.omit() %>% 
+  mutate(ror = log2FC.x - log2FC.y) %>% 
+  mutate(Z = (ror - mean(.$ror, na.rm = TRUE)) / sd(.$ror, na.rm = TRUE)) %>%
+  filter(Z < -2 | Z > 2) %>% 
+  dplyr::select(motif, ror, Z) %>% 
+  arrange(desc(Z))
+
+left_join(neg_distvprox_motif, ctrl_distvprox_motif, by = "motif") %>% 
+  na.omit() %>% 
+  mutate(ror = log2FC.x - log2FC.y) %>% 
+  mutate(Z = (ror - mean(.$ror, na.rm = TRUE)) / sd(.$ror, na.rm = TRUE)) %>%
+  filter(Z < -2 | Z > 2) %>% 
+  dplyr::select(motif, ror, Z) %>% 
+  arrange(desc(Z))
+
+
+###
+
+
+
+
+#how do positive and negative compare?
+#prox_motif <- motif_compare(CISBPRNA_hs_PWM, pos_prox, neg_prox)
+#write.table(prox_motif, "data/cisbpRNAposvnegproxcompare.txt")
+prox_motif <- as_tibble(read.table("data/cisbpRNAposvnegproxcompare.txt", header = TRUE)) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+prox_motif %>% dplyr::rename("neg" = ctrl, "pos" = case, "neg_freq" = ctrl_freq, "pos_freq" = case_freq, "neg_tot" = ctrl_tot, "pos_tot" = case_tot, "log2(prox/dist)" = log2FC) #90s
+prox_motif %>% mutate(motif = substr(motif,10, nchar(as.character(motif)))) %>% motif_plot() + ggtitle("Proximal UTRs (pos v neg)") + labs(x = "log2(pos/neg)")
+
+#dist_motif <- motif_compare(CISBPRNA_hs_PWM, pos_dist, neg_dist)
+#write.table(dist_motif, "data/cisbpRNAposvnegdistUTRcompare.txt")
+dist_motif <- as_tibble(read.table("data/cisbpRNAposvnegdistUTRcompare.txt", header = TRUE)) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+dist_motif %>% dplyr::rename("neg" = ctrl, "pos" = case, "neg_freq" = ctrl_freq, "pos_freq" = case_freq, "neg_tot" = ctrl_tot, "pos_tot" = case_tot, "log2(prox/dist)" = log2FC) #90s
+dist_motif %>% mutate(motif = substr(motif,10, nchar(as.character(motif)))) %>% motif_plot() + ggtitle("Distal UTRs (pos v neg)") + labs(x = "log2(pos/neg)")
+
+#special focus on proximal UTRs
+#major differences: 
+#posvctrl_prox_motif <- motif_compare(CISBPRNA_hs_PWM, pos_prox, ctrl_prox)
+#write.table(posvctrl_prox_motif, "data/cisbpRNAposproxvctrlUTRcompare.txt")
+posvctrl_prox_motif <- as_tibble(read.table("data/cisbpRNAposproxvctrlUTRcompare.txt", header = TRUE)) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+posvctrl_prox_motif %>% dplyr::rename("pos" = case, "pos_freq" = case_freq, "pos_tot" = case_tot, "log2(case/ctrl)" = log2FC) #90s
+posvctrl_prox_motif %>% mutate(motif = substr(motif,10, nchar(as.character(motif)))) %>% motif_plot() + ggtitle("Positively correlated Proximal UTRs") + labs(x = "log2(pos/ctrl)")
+
+#negvctrl_prox_motif <- motif_compare(CISBPRNA_hs_PWM, neg_prox, ctrl_prox)
+#write.table(negvctrl_prox_motif, "data/cisbpRNAnegproxvctrlUTRcompare.txt")
+negvctrl_prox_motif <- as_tibble(read.table("data/cisbpRNAnegproxvctrlUTRcompare.txt", header = TRUE)) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+negvctrl_prox_motif%>% dplyr::rename("neg" = case, "neg_freq" = case_freq, "neg_tot" = case_tot, "log2(case/ctrl)" = log2FC) #90s
+negvctrl_prox_motif %>% mutate(motif = substr(motif,10, nchar(as.character(motif)))) %>% motif_plot() + ggtitle("Negatively correlated Proximal UTRs") + labs(x = "log2(neg/ctrl)")
+
+#special focus on Distal UTRs
+#major differences: 
+#posvctrl_dist_motif <- motif_compare(CISBPRNA_hs_PWM, pos_dist, ctrl_dist) 
+#write.table(posvctrl_dist_motif, "data/cisbpRNAposdistvctrlUTRcompare.txt")
+posvctrl_dist_motif <- as_tibble(read.table("data/cisbpRNAposdistvctrlUTRcompare.txt", header = TRUE)) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+posvctrl_dist_motif %>% dplyr::rename("pos" = case, "pos_freq" = case_freq, "pos_tot" = case_tot, "log2(case/ctrl)" = log2FC) #90s
+posvctrl_dist_motif %>% mutate(motif = substr(motif,10, nchar(as.character(motif)))) %>% motif_plot() + ggtitle("Positively correlated Distal UTRs") + labs(x = "log2(pos/ctrl)")
+
+#negvctrl_dist_motif <- motif_compare(CISBPRNA_hs_PWM, neg_dist, ctrl_dist) 
+#write.table(negvctrl_dist_motif, "data/cisbpRNAnegdistvctrlUTRcompare.txt")
+negvctrl_dist_motif <- as_tibble(read.table("data/cisbpRNAnegdistvctrlUTRcompare.txt", header = TRUE)) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+negvctrl_dist_motif %>% dplyr::rename("neg" = case, "neg_freq" = case_freq, "neg_tot" = case_tot, "log2(case/ctrl)" = log2FC) #90s
+negvctrl_dist_motif %>% mutate(motif = substr(motif,10, nchar(as.character(motif)))) %>% motif_plot() + ggtitle("Negatively correlated Distal UTRs") + labs(x = "log2(neg/ctrl)")
+
+cisbp_dist <- left_join(posvctrl_dist_motif, negvctrl_dist_motif, by = "motif") %>% 
+  mutate(ctrl_freq.x = ctrl.x/sum(width(ctrl_dist)),
+         case_freq.x = case.x/sum(width(pos_dist)),
+         ctrl_freq.y = ctrl.y/sum(width(ctrl_dist)),
+         case_freq.y = case.y/sum(width(neg_dist)),
+         motif = substr(motif,10, nchar(as.character(motif))),
+         sig = ifelse(p_adj.y < 0.05 & p_adj.x < 0.05, "2", ifelse(p_adj.y < 0.05 | p_adj.x < 0.05, "1", "0")),
+         labeled = ifelse(sig == 2, T, F))
+
+cisbp_dist %>% ggplot(aes(x = log2(case_freq.y/ctrl_freq.y), y = log2(case_freq.x/ctrl_freq.x), label = motif)) + 
+  geom_point(aes(col = sig, shape = sig, size = sig)) + 
+  theme_cowplot() +
+  labs(x = "log2(neg_dist/ctrl_dist)", 
+       y = "log2(pos_dist/ctrl_dist)",
+       title = "CisbpRNA Distal UTR enrichment", subtitle = "Density") +
+  scale_color_manual(values = viridis::viridis(4)) +
+  scale_shape_manual(values = c(20, 1, 10)) +
+  scale_size_manual(values = c(1, 3, 3)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed")  +
+  ggrepel::geom_text_repel(data = subset(cisbp_dist, labeled == "TRUE"), nudge_y = 0.025, col = "Black")
+
+cisbp_prox <- left_join(posvctrl_prox_motif, negvctrl_prox_motif, by = "motif") %>% 
+  mutate(ctrl_freq.x = ctrl.x/sum(width(ctrl_prox)),
+         case_freq.x = case.x/sum(width(pos_prox)),
+         ctrl_freq.y = ctrl.y/sum(width(ctrl_prox)),
+         case_freq.y = case.y/sum(width(neg_prox)),
+         motif = substr(motif,10, nchar(as.character(motif))),
+         sig = ifelse(p_adj.y < 0.05 & p_adj.x < 0.05, "2", ifelse(p_adj.y < 0.05 | p_adj.x < 0.05, "1", "0")),
+         labeled = ifelse(sig == 2, T, F))
+
+cisbp_prox %>% ggplot(aes(x = log2(case_freq.y/ctrl_freq.y), y = log2(case_freq.x/ctrl_freq.x), label = motif)) + 
+  geom_point(aes(col = sig, shape = sig, size = sig)) + 
+  theme_cowplot() +
+  labs(x = "log2(neg_prox/ctrl_prox)", 
+       y = "log2(pos_prox/ctrl_prox)",
+       title = "CisbpRNA Proximal UTR enrichment", subtitle = "Density") +
+  scale_color_manual(values = viridis::viridis(4)) +
+  scale_shape_manual(values = c(20, 1, 10)) +
+  scale_size_manual(values = c(1, 3, 3)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed")  +
+  ggrepel::geom_text_repel(data = subset(cisbp_prox, labeled == "TRUE"), nudge_y = 0.025, col = "Black")
+```
+
+```{r, CISBPRNA summary}
+all_cisbpRNA <- list(posvctrl_prox_motif, posvctrl_dist_motif, negvctrl_prox_motif, negvctrl_dist_motif)
+names(all_cisbpRNA) <- c("posvctrl_prox", "posvctrl_dist", "negvctrl_prox", "negvctrl_dist")
+all_cisbpRNA <- bind_rows(all_cisbpRNA, .id = "sample") %>% separate(sample, into = c("compare", "UTR"), sep = "_") %>% ungroup() %>% mutate(RBP = substr(motif, 10, nchar(as.character(motif))))
+
+pos_prox_enr <- all_cisbpRNA %>% filter(compare == "posvctrl", UTR == "prox", log2FC > 0, p_adj < 0.05) %>% pull(RBP) %>% as.character() %>% unique()
+pos_dist_enr <- all_cisbpRNA %>% filter(compare == "posvctrl", UTR == "dist", log2FC > 0, p_adj < 0.05) %>% pull(RBP) %>% as.character() %>% unique()
+pos_prox_dep <- all_cisbpRNA %>% filter(compare == "posvctrl", UTR == "prox", log2FC < 0, p_adj < 0.05) %>% pull(RBP) %>% as.character() %>% unique()
+pos_dist_dep <- all_cisbpRNA %>% filter(compare == "posvctrl", UTR == "dist", log2FC < 0, p_adj < 0.05) %>% pull(RBP) %>% as.character() %>% unique()
+
+upset_dat <-list(pos_prox_enr = pos_prox_enr, pos_prox_dep = pos_prox_dep, pos_dist_enr = pos_dist_enr, pos_dist_dep = pos_dist_dep)
+upset(fromList(upset_dat), order.by = "freq", empty.intersections = "on")
+
+neg_prox_enr <- all_cisbpRNA %>% filter(compare == "negvctrl", UTR == "prox", log2FC > 0, p_adj < 0.05) %>% pull(RBP) %>% as.character() %>% unique()
+neg_dist_enr <- all_cisbpRNA %>% filter(compare == "negvctrl", UTR == "dist", log2FC > 0, p_adj < 0.05) %>% pull(RBP) %>% as.character() %>% unique()
+neg_prox_dep <- all_cisbpRNA %>% filter(compare == "negvctrl", UTR == "prox", log2FC < 0, p_adj < 0.05) %>% pull(RBP) %>% as.character() %>% unique()
+neg_dist_dep <- all_cisbpRNA %>% filter(compare == "negvctrl", UTR == "dist", log2FC < 0, p_adj < 0.05) %>% pull(RBP) %>% as.character() %>% unique()
+
+upset_dat <-list(neg_prox_enr = neg_prox_enr, neg_prox_dep = neg_prox_dep, neg_dist_enr = neg_dist_enr, neg_dist_dep = neg_dist_dep)
+upset(fromList(upset_dat), order.by = "freq", empty.intersections = "on")
+
+##enriched in Pos but depleted in Neg?
+upset_dat <-list(neg_prox_dep = neg_prox_dep, pos_prox_enr = pos_prox_enr, neg_dist_dep = neg_dist_dep, pos_dist_enr = pos_dist_enr)
+upset(fromList(upset_dat), order.by = "freq", empty.intersections = "on")
+##depleted in Pos but enriched in Neg?
+upset_dat <-list(neg_prox_enr = neg_prox_enr, pos_prox_dep = pos_prox_dep, neg_dist_enr = neg_dist_enr, pos_dist_dep = pos_dist_dep)
+upset(fromList(upset_dat), order.by = "freq", empty.intersections = "on")
+```
+
+```{r, }
+CISBPRNA_hs_PWM[all_cisbpRNA %>% filter(compare == "negvctrl", UTR == "dist", log2FC > 0, p_adj < 0.05) %>% pull(motif)] %>% ggseqlogo::ggseqlogo(method = "prob", ncol = 5) + ggtitle("Motifs Enriched in Negatively Correlated Distal UTRs")
+
+CISBPRNA_hs_PWM[all_cisbpRNA %>% filter(compare == "posvctrl", UTR == "prox", log2FC > 0, p_adj < 0.05) %>% pull(motif)] %>% ggseqlogo::ggseqlogo(method = "prob", ncol = 5) + ggtitle("Motifs Enriched in Positively Correlated Proximal UTRs")
+```
+
+## CisbpRNA Summary
+
+__SAMD4A or SMAUG1__ is enriched in positive proximal UTRs over distal UTRs
+
+Nothing is specifically enriched for pos proximal UTRs
+Specifically depleted for pos proximal UTRs: "RBMS2" "RBM46"
+
+Specifically enriched in pos distal UTRs: "MBNL3"   "hnRNPK"  "BRUNOL6" "SRSF9"   "FMR1"    "RBM4B"   "EIF4B"   "FXR2"    "SRSF1"   "NONO"   
+Specifically depleted in pos distal UTRs: "CPEB3"  "RALY"   "TIA1"   "SF3B4"  "PTBP1"  "ELAVL2" "ELAVL1" "U2AF2"
+
+
+Specifically enriched in neg proximal utrs: "KHDRBS2" "KHDRBS1" "ZCRB1"   "RBM41"
+specifically depleted in neg proximal utrs: "RBMX"    "SAMD4A"  "MBNL3"   "SRSF4"   "PCBP4"   "LIN28A"  "EIF4B"   "FMR1"    "SRSF1"   "PPRC1"   "RBFOX2"  "SRSF9"   "FXR2" "ESRP2"   "ACO1"    "HNRNPH2" "NONO"    "RBM4B"   "YTHDC1"  "SRSF2"   "hnRNPK"  "ZC3H10"
+
+specifically enriched in neg distal utrs: "HNRNPC"   "HNRNPCL1" "RALY"     "U2AF2"    "SART3"    "PTBP1"    "PABPC4" 
+specifically depleted in neg distal utrs: "RBM5"    "hnRNPLL" "RBMY1F"  "SRSF12"  "BRUNOL6" "FUS"     "A2BP1"   "EIF2S1"  "RBM38" 
+
+----
+
+no overlap of positive and distal enrichment or depletion
+
+generally enriched in Pos UTRs: "RBMX"   "PCBP4"  "SAMD4A"
+generally depleted in Pos UTRs: "HNRNPC"   "HNRNPCL1"
+
+generally enriched in Neg UTRs: "PABPC1" "SF3B4"  "ELAVL1" "CPEB3"  "TIA1"   "DAZAP1" "HNRNPR" "ELAVL3" "RBMS2"  "A1CF"   "ELAVL2"
+generally depleted in Neg UTRs: "RBMX"    "SAMD4A"  "MBNL3"   "SRSF4"   "PCBP4"   "LIN28A"  "EIF4B"   "FMR1"    "SRSF1"   "PPRC1"   "RBFOX2"  "SRSF9"   "FXR2"  "ESRP2"   "HNRNPH2" "NONO"    "SRSF2"   "hnRNPK"  "ZC3H10" 
+
+----
+
+
+
+
+```{r, RBNS_scanning}
+#
+#pos_RBNS <- motif_compare(RBNS_PWM, pos_prox, pos_dist)
+#write.table(pos_RBNS, "data/RBNSposUTRcompare.txt")
+pos_RBNS <- as_tibble(read.table("data/RBNSposUTRcompare.txt", header = TRUE)) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+pos_RBNS %>% dplyr::rename("dist" = ctrl, "prox" = case, "dist_freq" = ctrl_freq, "prox_freq" = case_freq, "dist_tot" = ctrl_tot, "prox_tot" = case_tot, "log2(prox/dist)" = log2FC) #6s
+pos_RBNS %>% mutate(motif = substr(motif, 1, nchar(as.character(motif)) - 11)) %>% motif_plot(.) + ggtitle("Positive Correlated Genes")  + labs(x = "log2(prox/dist)")
+
+#
+#neg_RBNS <- motif_compare(RBNS_PWM, neg_prox, neg_dist)
+#write.table(neg_RBNS, "data/RBNSnegUTRcompare.txt")
+neg_RBNS <- as_tibble(read.table("data/RBNSnegUTRcompare.txt", header = TRUE)) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+neg_RBNS %>% dplyr::rename("dist" = ctrl, "prox" = case, "dist_freq" = ctrl_freq, "prox_freq" = case_freq, "dist_tot" = ctrl_tot, "prox_tot" = case_tot, "log2(prox/dist)" = log2FC) #60s
+neg_RBNS %>% mutate(motif = substr(motif, 1, nchar(as.character(motif)) - 11)) %>% motif_plot(.) + ggtitle("Negative Correlated Genes") + labs(x = "log2(prox/dist)")
+
+#
+#ctrl_RBNS <- motif_compare(RBNS_PWM, ctrl_prox, ctrl_dist)
+#write.table(ctrl_RBNS, "data/RBNScontrolUTRcompare.txt")
+ctrl_RBNS <- as_tibble(read.table("data/RBNScontrolUTRcompare.txt", header = TRUE)) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+ctrl_RBNS %>% dplyr::rename("dist" = ctrl, "prox" = case, "dist_freq" = ctrl_freq, "prox_freq" = case_freq, "dist_tot" = ctrl_tot, "prox_tot" = case_tot, "log2(prox/dist)" = log2FC) #6min
+ctrl_RBNS %>% mutate(motif = substr(motif, 1, nchar(as.character(motif)) - 11)) %>% motif_plot(.) + ggtitle("Control Genes") + labs(x = "log2(prox/dist)")
+
+
+##dist/prox
+#pos_distvprox_RBNS <- motif_compare(RBNS_PWM, pos_dist, pos_prox)
+#write.table(pos_distvprox_RBNS, "data/RBNSpos_distvprox_compare.txt")
+pos_distvprox_RBNS <- as_tibble(read.table("data/RBNSpos_distvprox_compare.txt", header = TRUE)) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+pos_distvprox_RBNS %>% dplyr::rename("dist" = case, "prox" = ctrl, "dist_freq" = case_freq, "prox_freq" = ctrl_freq, "dist_tot" = case_tot, "prox_tot" = ctrl_tot, "log2(dist/prox)" = log2FC) #6s
+pos_distvprox_RBNS %>% mutate(motif = substr(motif, 1, nchar(as.character(motif)) - 11)) %>% motif_plot(.) + ggtitle("Positive Correlated Genes")  + labs(x = "log2(dist/prox)")
+
+#
+#neg_distvprox_RBNS <- motif_compare(RBNS_PWM, neg_dist, neg_prox)
+#write.table(neg_distvprox_RBNS, "data/RBNSneg_distvprox_compare.txt")
+neg_distvprox_RBNS <- as_tibble(read.table("data/RBNSneg_distvprox_compare.txt", header = TRUE)) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+neg_distvprox_RBNS %>% dplyr::rename("dist" = case, "prox" = ctrl, "dist_freq" = case_freq, "prox_freq" = ctrl_freq, "dist_tot" = case_tot, "prox_tot" = ctrl_tot, "log2(dist/prox)" = log2FC) #60s
+neg_distvprox_RBNS %>% mutate(motif = substr(motif, 1, nchar(as.character(motif)) - 11)) %>% motif_plot(.) + ggtitle("Negative Correlated Genes") + labs(x = "log2(dist/prox)")
+
+#
+#ctrl_distvprox_RBNS <- motif_compare(RBNS_PWM, ctrl_dist, ctrl_prox)
+#write.table(ctrl_distvprox_RBNS, "data/RBNScontrol_distvprox_compare.txt")
+ctrl_distvprox_RBNS <- as_tibble(read.table("data/RBNScontrol_distvprox_compare.txt", header = TRUE)) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+ctrl_distvprox_RBNS %>% dplyr::rename("dist" = case, "prox" = ctrl, "dist_freq" = case_freq, "prox_freq" = ctrl_freq, "dist_tot" = case_tot, "prox_tot" = ctrl_tot, "log2(dist/prox)" = log2FC) #6min
+ctrl_distvprox_RBNS %>% mutate(motif = substr(motif, 1, nchar(as.character(motif)) - 11)) %>% motif_plot(.) + ggtitle("Control Genes") + labs(x = "log2(dist/prox)")
+
+
+###BRESLOWDAY###
+
+BDT_pos_RBNS <- left_join(pos_distvprox_RBNS, ctrl_distvprox_RBNS, by = "motif") %>% 
+  na.omit() %>%  
+  rowwise() %>%
+  mutate(ctrl_freq.x = ctrl.x/sum(width(pos_prox)),
+         case_freq.x = case.x/sum(width(pos_dist)),
+         ctrl_freq.y = ctrl.y/sum(width(ctrl_prox)),
+         case_freq.y = case.y/sum(width(ctrl_dist)),
+         ror_den = log2(case_freq.x/ctrl_freq.x)-log2(case_freq.y/ctrl_freq.y),
+         ror_cts = log2(case.x/ctrl.x) - log2(case.y/ctrl.y), 
+         BDT_pval_cts = BreslowDayTest(contingency_cube(as.numeric(case.x), as.numeric(case_tot.x), as.numeric(ctrl.x), as.numeric(ctrl_tot.x), as.numeric(case.y), as.numeric(case_tot.y), as.numeric(ctrl.y), as.numeric(ctrl_tot.y)))[[3]]) %>% 
+  ungroup() %>% 
+  mutate(BDT_padj_cts = p.adjust(.$BDT_pval_cts, method = "BH")) %>%
+  dplyr::select(motif, ror_den, ror_cts, BDT_pval_cts, BDT_padj_cts) %>%  
+  arrange(BDT_padj_cts)
+
+p <- BDT_pos_RBNS %>% mutate(sig = ifelse(BDT_padj_cts < 0.05, "< 0.05", "ns"),
+                             RBP = substr(motif, 1, nchar(as.character(motif)) - 11))
+p %>% ggplot(aes(x = ror_cts, y = -log(BDT_padj_cts), col = sig, alpha = sig)) +
+  geom_point() + 
+  scale_color_manual(values = c("Red", "Black")) +
+  scale_alpha_manual(values = c(1,0.1)) +
+  geom_text(data = subset(p, sig == "< 0.05"), aes(label = RBP), nudge_y = 0.5) +
+  theme_cowplot() +
+  labs(x = "log2(pos_dist/pos_prox) - log2(ctrl_dist/ctrl_prox)", 
+       title = "BreslowDay Positive Dist/Prox", 
+       subtitle = "Counts")
+
+BDT_neg_RBNS <- left_join(neg_distvprox_RBNS, ctrl_distvprox_RBNS, by = "motif") %>% 
+  na.omit() %>% 
+  rowwise() %>% 
+  mutate(ctrl_freq.x = ctrl.x/sum(width(neg_prox)),
+         case_freq.x = case.x/sum(width(neg_dist)),
+         ctrl_freq.y = ctrl.y/sum(width(ctrl_prox)),
+         case_freq.y = case.y/sum(width(ctrl_dist)),
+         ror_den = log2(case_freq.x/ctrl_freq.x)-log2(case_freq.y/ctrl_freq.y),
+         ror_cts = log2(case.x/ctrl.x) - log2(case.y/ctrl.y), 
+         BDT_pval_cts = BreslowDayTest(contingency_cube(as.numeric(case.x), as.numeric(case_tot.x), as.numeric(ctrl.x), as.numeric(ctrl_tot.x), as.numeric(case.y), as.numeric(case_tot.y), as.numeric(ctrl.y), as.numeric(ctrl_tot.y)))[[3]]) %>% 
+  ungroup() %>% 
+  mutate(BDT_padj_cts = p.adjust(BDT_pval_cts, method = "BH")) %>%
+  dplyr::select(motif, ror_den, ror_cts, BDT_pval_cts, BDT_padj_cts) %>%
+  ungroup() %>% 
+  arrange(BDT_padj_cts)
+
+p <- BDT_neg_RBNS %>% mutate(sig = ifelse(BDT_padj_cts < 0.05, "< 0.05", "ns"),
+                             RBP = substr(motif, 1, nchar(as.character(motif)) - 11))
+p %>% ggplot(aes(x = ror_cts, y = -log(BDT_padj_cts), col = sig, alpha = sig)) +
+  geom_point() + 
+  scale_color_manual(values = c("Red", "Black")) +
+  scale_alpha_manual(values = c(1,0.1)) +
+  ggrepel::geom_text_repel(data = subset(p, sig == "< 0.05"), aes(label = RBP), nudge_y = 0.5) +
+  theme_cowplot() +
+  labs(x = "log2(neg_dist/neg_prox) - log2(ctrl_dist/ctrl_prox)", 
+       title = "BreslowDay Positive Dist/Prox",
+       subtitle = "Counts")
+
+p <- left_join(BDT_pos_RBNS, BDT_neg_RBNS, by = "motif") %>% 
+  mutate(RBP = substr(motif, 1, nchar(as.character(motif)) - 11), sig = ifelse(BDT_padj_cts.y < 0.05 & BDT_padj_cts.x < 0.05, "2", ifelse(BDT_padj_cts.y < 0.05 | BDT_padj_cts.x < 0.05, "1", "0")), labeled = ifelse(sig == 2 & ((ror_cts.y < 0 & ror_cts.x > 0) | (ror_cts.y > 0 & ror_cts.x < 0)), T, F)) 
+p %>%
+  ggplot(aes(x = ror_cts.y, y = ror_cts.x)) + 
+  geom_point(aes(shape = sig, col = sig, size = sig)) + 
+  theme_cowplot() +
+  labs(x = "log2(neg_dist/neg_prox) - log2(ctrl_dist/ctrl_prox)", 
+       y = "log2(pos_dist/pos_prox) - log2(ctrl_dist/ctrl_prox)",
+       title = "RBNS enrichment",
+       subtitle = "Counts") +
+  scale_color_manual(values = c("black", "#2D708EFF", "#3CBB75FF")) +
+  scale_shape_manual(values = c(20, 1, 10)) +
+  scale_size_manual(values = c(1, 3, 3)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_text(data = subset(p, labeled == "TRUE"), aes(label = RBP), nudge_y = 0.025, col = "#3CBB75FF")
+
+p %>%
+  ggplot(aes(x = ror_den.y, y = ror_den.x)) + 
+  geom_point(aes(shape = sig, col = sig, size = sig)) + 
+  theme_cowplot() +
+  labs(x = "log2(neg_dist/neg_prox) - log2(ctrl_dist/ctrl_prox)", 
+       y = "log2(pos_dist/pos_prox) - log2(ctrl_dist/ctrl_prox)",
+       title = "RBNS enrichment",
+       subtitle = "Density") +
+  scale_color_manual(values = c("black", "#2D708EFF", "#3CBB75FF")) +
+  scale_shape_manual(values = c(20, 1, 10)) +
+  scale_size_manual(values = c(1, 3, 3)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_text(data = subset(p, labeled == "TRUE"), aes(label = RBP), nudge_y = 0.025, col = "#3CBB75FF")
+
+p <- left_join(BDT_pos_RBNS, BDT_neg_RBNS, by = "motif") %>% 
+  mutate(RBP = substr(motif, 1, nchar(as.character(motif)) - 11), sig = ifelse(BDT_padj_cts.y < 0.05 & BDT_padj_cts.x < 0.05, "2", ifelse(BDT_padj_cts.y < 0.05 | BDT_padj_cts.x < 0.05, "1", "0")), labeled = ifelse(grepl(x = RBP, pattern = "ELAVL"), T, F)) 
+p %>%
+  ggplot(aes(x = ror_den.y, y = ror_den.x)) + 
+  geom_point(aes(shape = sig, col = sig, size = sig)) + 
+  theme_cowplot() +
+  labs(x = "log2(neg_dist/neg_prox) - log2(ctrl_dist/ctrl_prox)", 
+       y = "log2(pos_dist/pos_prox) - log2(ctrl_dist/ctrl_prox)",
+       title = "RBNS enrichment",
+       subtitle = "Density") +
+  scale_color_manual(values = c("black", "#2D708EFF", "#3CBB75FF")) +
+  scale_shape_manual(values = c(20, 1, 10)) +
+  scale_size_manual(values = c(1, 3, 3)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  ggrepel::geom_text_repel(data = subset(p, labeled == "TRUE"), aes(label = RBP), nudge_y = 0.025, col = c("#2D708EFF","Black"))
+
+left_join(BDT_pos_RBNS, BDT_neg_RBNS, by = "motif") %>% 
+  mutate(sig = ifelse(BDT_padj_cts.y < 0.05 & BDT_padj_cts.x < 0.05, "2", ifelse(BDT_padj_cts.y < 0.05 | BDT_padj_cts.x < 0.05, "1", "0"))) %>% filter(sig == 2, (ror_cts.y < 0 & ror_cts.x > 0) | (ror_cts.y > 0 & ror_cts.x < 0)) %>% arrange(ror_cts.y)
+###
+
+###Zscores?
+#left_join(pos_distvprox_RBNS, ctrl_distvprox_RBNS, by = "motif") %>% 
+#  na.omit() %>% 
+#  mutate(ror = log2FC.x - log2FC.y) %>% 
+#  mutate(Z = (ror - mean(.$ror, na.rm = TRUE)) / sd(.$ror, na.rm = TRUE)) %>%
+#  filter(Z < -2 | Z > 2) %>% 
+#  dplyr::select(motif, ror, Z) %>% 
+#  arrange(desc(Z))
+
+#left_join(neg_distvprox_RBNS, ctrl_distvprox_RBNS, by = "motif") %>% 
+#  na.omit() %>% 
+#  mutate(ror = log2FC.x - log2FC.y) %>% 
+#  mutate(Z = (ror - mean(.$ror, na.rm = TRUE)) / sd(.$ror, na.rm = TRUE)) %>%
+#  filter(Z < -2 | Z > 2) %>% 
+#  dplyr::select(motif, ror, Z) %>% 
+#  arrange(desc(Z))
+
+
+###
+
+
+#how do positive and negative compare?
+
+#prox_RBNS <- motif_compare(RBNS_PWM, pos_prox, neg_prox)
+#write.table(prox_RBNS, "data/RBNSposvnegproxcompare.txt")
+prox_RBNS <- as_tibble(read.table("data/RBNSposvnegproxcompare.txt", header = TRUE)) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+prox_RBNS %>% dplyr::rename("neg" = ctrl, "pos" = case,"neg_freq" = ctrl_freq, "pos_freq" = case_freq, "neg_tot" = ctrl_tot, "pos_tot" = case_tot, "log2(prox/dist)" = log2FC) #6s
+prox_RBNS %>% mutate(motif = substr(motif, 1, nchar(as.character(motif)) - 11)) %>% motif_plot(.) + ggtitle("Proximal UTRs (pos v neg)") + labs(x = "log2(pos/neg)")
+
+#dist_RBNS <- motif_compare(RBNS_PWM, pos_dist, neg_dist)
+#write.table(dist_RBNS, "data/RBNSposvnegdistcompare.txt")
+dist_RBNS <- as_tibble(read.table("data/RBNSposvnegdistcompare.txt", header = TRUE)) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+dist_RBNS %>% dplyr::rename("neg" = ctrl, "pos" = case,"neg_freq" = ctrl_freq, "pos_freq" = case_freq, "neg_tot" = ctrl_tot, "pos_tot" = case_tot, "log2(prox/dist)" = log2FC) #6s
+dist_RBNS %>% mutate(motif = substr(motif, 1, nchar(as.character(motif)) - 11)) %>% motif_plot(.) + ggtitle("Distal UTRs (pos v neg)") + labs(x = "log2(pos/neg)")
+
+#special focus on proximal UTRs
+#major differences: 
+#posvctrl_prox_RBNS <- motif_compare(RBNS_PWM, pos_prox, ctrl_prox)
+#write.table(posvctrl_prox_RBNS, "data/RBNSposproxvctrlUTRcompare.txt")
+posvctrl_prox_RBNS <- as_tibble(read.table("data/RBNSposproxvctrlUTRcompare.txt", header = TRUE)) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+posvctrl_prox_RBNS %>% dplyr::rename("pos" = case, "pos_freq" = case_freq, "pos_tot" = case_tot, "log2(case/ctrl)" = log2FC) #6s
+posvctrl_prox_RBNS %>% mutate(motif = substr(motif, 1, nchar(as.character(motif)) - 11)) %>% motif_plot(.) + ggtitle("Positive Correlated Proximal UTRs") + labs(x = "log2(pos/ctrl)")
+
+#negvctrl_prox_RBNS <- motif_compare(RBNS_PWM, neg_prox, ctrl_prox)
+#write.table(negvctrl_prox_RBNS, "data/RBNSnegproxvctrlUTRcompare.txt")
+negvctrl_prox_RBNS <- as_tibble(read.table("data/RBNSnegproxvctrlUTRcompare.txt", header = TRUE)) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+negvctrl_prox_RBNS %>% dplyr::rename("neg" = case, "neg_freq" = case_freq, "neg_tot" = case_tot, "log2(case/ctrl)" = log2FC) #6s
+negvctrl_prox_RBNS %>% mutate(motif = substr(motif, 1, nchar(as.character(motif)) - 11)) %>% motif_plot(.) + ggtitle("Negative Correlated Proximal UTRs") + labs(x = "log2(neg/ctrl)")
+
+
+#special focus on Distal UTRs
+#major differences: 
+#posvctrl_dist_RBNS <- motif_compare(RBNS_PWM, pos_dist, ctrl_dist)
+#write.table(posvctrl_dist_RBNS, "data/RBNSposdistvctrlUTRcompare.txt")
+posvctrl_dist_RBNS <- as_tibble(read.table("data/RBNSposdistvctrlUTRcompare.txt", header = TRUE)) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+posvctrl_dist_RBNS %>% dplyr::rename("pos" = case, "pos_freq" = case_freq, "pos_tot" = case_tot, "log2(case/ctrl)" = log2FC) #6s
+posvctrl_dist_RBNS %>% mutate(motif = substr(motif, 1, nchar(as.character(motif)) - 11)) %>% motif_plot(.) + ggtitle("Positive Correlated Distal UTRs") + labs(x = "log2(pos/ctrl)")
+
+#negvctrl_dist_RBNS <- motif_compare(RBNS_PWM, neg_dist, ctrl_dist)
+#write.table(negvctrl_dist_RBNS, "data/RBNSnegdistvctrlUTRcompare.txt")
+negvctrl_dist_RBNS <- as_tibble(read.table("data/RBNSnegdistvctrlUTRcompare.txt", header = TRUE)) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+negvctrl_dist_RBNS %>% dplyr::rename("neg" = case, "neg_freq" = case_freq, "neg_tot" = case_tot, "log2(case/ctrl)" = log2FC) #6s
+negvctrl_dist_RBNS %>% mutate(motif = substr(motif, 1, nchar(as.character(motif)) - 11)) %>% motif_plot(.) + ggtitle("Negative Correlated Distal UTRs") + labs(x = "log2(neg/ctrl)")
+
+RBNS_dist <- left_join(posvctrl_dist_RBNS, negvctrl_dist_RBNS, by = "motif") %>% 
+  mutate(ctrl_freq.x = ctrl.x/sum(width(ctrl_dist)),
+         case_freq.x = case.x/sum(width(pos_dist)),
+         ctrl_freq.y = ctrl.y/sum(width(ctrl_dist)),
+         case_freq.y = case.y/sum(width(neg_dist)),
+         motif = substr(motif, 1, nchar(as.character(motif)) - 11),
+         sig = ifelse(p_adj.y < 0.05 & p_adj.x < 0.05, "2", ifelse(p_adj.y < 0.05 | p_adj.x < 0.05, "1", "0")),
+         labeled = ifelse(sig == 2, T, F))
+
+RBNS_dist %>% ggplot(aes(x = log2(case_freq.y/ctrl_freq.y), y = log2(case_freq.x/ctrl_freq.x), label = motif)) + 
+  geom_point(aes(col = sig, shape = sig, size = sig)) + 
+  theme_cowplot() +
+  labs(x = "log2(neg_dist/ctrl_dist)", 
+       y = "log2(pos_dist/ctrl_dist)",
+       title = "RBNS Distal UTR enrichment", subtitle = "Density") +
+  scale_color_manual(values = viridis::viridis(4)) +
+  scale_shape_manual(values = c(20, 1, 10)) +
+  scale_size_manual(values = c(1, 3, 3)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed")  +
+  ggrepel::geom_text_repel(data = subset(RBNS_dist, labeled == "TRUE"), nudge_y = 0.025, col = "Black")
+
+RBNS_prox <- left_join(posvctrl_prox_RBNS, negvctrl_prox_RBNS, by = "motif") %>% 
+  mutate(ctrl_freq.x = ctrl.x/sum(width(ctrl_prox)),
+         case_freq.x = case.x/sum(width(pos_prox)),
+         ctrl_freq.y = ctrl.y/sum(width(ctrl_prox)),
+         case_freq.y = case.y/sum(width(neg_prox)),
+         motif = substr(motif, 1, nchar(as.character(motif)) - 11),
+         sig = ifelse(p_adj.y < 0.05 & p_adj.x < 0.05, "2", ifelse(p_adj.y < 0.05 | p_adj.x < 0.05, "1", "0")),
+         labeled = ifelse(sig == 2, T, F))
+
+RBNS_prox %>% ggplot(aes(x = log2(case_freq.y/ctrl_freq.y), y = log2(case_freq.x/ctrl_freq.x), label = motif)) + 
+  geom_point(aes(col = sig, shape = sig, size = sig)) + 
+  theme_cowplot() +
+  labs(x = "log2(neg_prox/ctrl_prox)", 
+       y = "log2(pos_prox/ctrl_prox)",
+       title = "RBNS Proximal UTR enrichment", subtitle = "Density") +
+  scale_color_manual(values = viridis::viridis(4)) +
+  scale_shape_manual(values = c(20, 1, 10)) +
+  scale_size_manual(values = c(1, 3, 3)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed")  +
+  ggrepel::geom_text_repel(data = subset(RBNS_prox, labeled == "TRUE"), nudge_y = 0.025, col = "Black")
+
+```
+
+```{r, RBNS overlap}
+all_RBNS <- list(posvctrl_prox_RBNS, posvctrl_dist_RBNS, negvctrl_prox_RBNS, negvctrl_dist_RBNS)
+names(all_RBNS) <- c("posvctrl_prox", "posvctrl_dist", "negvctrl_prox", "negvctrl_dist")
+all_RBNS <- bind_rows(all_RBNS, .id = "sample") %>% separate(sample, into = c("compare", "UTR"), sep = "_") %>% ungroup() %>% mutate(RBP = substr(motif, 1, nchar(as.character(motif))-11))
+
+pos_prox_enr <- all_RBNS %>% filter(compare == "posvctrl", UTR == "prox", log2FC > 0, p_adj < 0.05) %>% pull(RBP) %>% as.character() %>% unique()
+pos_dist_enr <- all_RBNS %>% filter(compare == "posvctrl", UTR == "dist", log2FC > 0, p_adj < 0.05) %>% pull(RBP) %>% as.character() %>% unique()
+pos_prox_dep <- all_RBNS %>% filter(compare == "posvctrl", UTR == "prox", log2FC < 0, p_adj < 0.05) %>% pull(RBP) %>% as.character() %>% unique()
+pos_dist_dep <- all_RBNS %>% filter(compare == "posvctrl", UTR == "dist", log2FC < 0, p_adj < 0.05) %>% pull(RBP) %>% as.character() %>% unique()
+
+upset_dat <-list(pos_prox_enr = pos_prox_enr, pos_prox_dep = pos_prox_dep, pos_dist_enr = pos_dist_enr, pos_dist_dep = pos_dist_dep)
+upset(fromList(upset_dat), order.by = "freq", empty.intersections = "on")
+
+neg_prox_enr <- all_RBNS %>% filter(compare == "negvctrl", UTR == "prox", log2FC > 0, p_adj < 0.05) %>% pull(RBP) %>% as.character() %>% unique()
+neg_dist_enr <- all_RBNS %>% filter(compare == "negvctrl", UTR == "dist", log2FC > 0, p_adj < 0.05) %>% pull(RBP) %>% as.character() %>% unique()
+neg_prox_dep <- all_RBNS %>% filter(compare == "negvctrl", UTR == "prox", log2FC < 0, p_adj < 0.05) %>% pull(RBP) %>% as.character() %>% unique()
+neg_dist_dep <- all_RBNS %>% filter(compare == "negvctrl", UTR == "dist", log2FC < 0, p_adj < 0.05) %>% pull(RBP) %>% as.character() %>% unique()
+
+upset_dat <-list(neg_prox_enr = neg_prox_enr, neg_prox_dep = neg_prox_dep, neg_dist_enr = neg_dist_enr, neg_dist_dep = neg_dist_dep)
+upset(fromList(upset_dat), order.by = "freq", empty.intersections = "on")
+
+##enriched in Pos but depleted in Neg?
+upset_dat <-list(neg_prox_dep = neg_prox_dep, pos_prox_enr = pos_prox_enr, neg_dist_dep = neg_dist_dep, pos_dist_enr = pos_dist_enr)
+upset(fromList(upset_dat), order.by = "freq", empty.intersections = "on")
+##depleted in Pos but enriched in Neg?
+upset_dat <-list(neg_prox_enr = neg_prox_enr, pos_prox_dep = pos_prox_dep, neg_dist_enr = neg_dist_enr, pos_dist_dep = pos_dist_dep)
+upset(fromList(upset_dat), order.by = "freq", empty.intersections = "on")
+```
+
+## RBNS Summary
+
+
+##All Motifs together?
+
+```{r, }
+#AUBPs defined as AmiGO 2 ID - GO:0017091
+AUBPs <- c("ELAVL1", "ELAVL2", "ELAVL3", "ELAVL4", "ZFP36") #, "HNRNPA0","HNRNPD", "HNRNPC", "KHSRP", "TIA1")
+
+p <- rbind(cisbp_prox, RBNS_prox) %>%
+  mutate(sig = ifelse(p_adj.y < 0.01 & p_adj.x < 0.01, "2", ifelse(p_adj.y < 0.01 | p_adj.x < 0.01, "1", "0")),
+         labeled = ifelse(sig == 2, T, F))
+p %>% ggplot(aes(x = log2(case_freq.y/ctrl_freq.y), y = log2(case_freq.x/ctrl_freq.x), label = motif)) + 
+  geom_point(aes(col = sig, shape = sig, size = sig)) + 
+  theme_cowplot() +
+  labs(x = "log2(neg_prox/ctrl_prox)", 
+       y = "log2(pos_prox/ctrl_prox)",
+       title = "RBP Motif proximal UTR enrichment", subtitle = "Density") +
+  scale_color_manual(values = viridis::viridis(4)) +
+  scale_shape_manual(values = c(20, 1, 10)) +
+  scale_size_manual(values = c(1, 3, 3)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed")  +
+  ggrepel::geom_text_repel(data = subset(p, labeled == "TRUE"), nudge_y = 0.025, col = "Black")
+
+p <- rbind(cisbp_dist, RBNS_dist) %>%
+  mutate(sig = ifelse(p_adj.y < 0.01 & p_adj.x < 0.01, "2", ifelse(p_adj.y < 0.01 | p_adj.x < 0.01, "1", "0")),
+         #labeled = ifelse(sig == 2, T, F),
+         labeled = ifelse(motif %in% AUBPs & sig == 2, T, F)) 
+p %>% ggplot(aes(x = log2(case_freq.y/ctrl_freq.y), y = log2(case_freq.x/ctrl_freq.x), label = motif)) + 
+  geom_point(aes(col = sig, shape = sig, size = sig)) + 
+  theme_cowplot() +
+  labs(x = "Motif Enrichment, log2(Negative / Control)", 
+       y = "Motif Enrichment, log2(Positive / Control)",
+       title = "RBP Motif Distal UTRs") +
+  scale_color_manual(values = viridis::viridis(4)) +
+  scale_shape_manual(values = c(20, 1, 10)) +
+  scale_size_manual(values = c(1, 3, 3)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed")  +
+  ggrepel::geom_text_repel(data = subset(p, labeled == "TRUE") %>% arrange(motif, p_adj.x, p_adj.y) %>% .[c(1,5,8,10),], nudge_y = 0.025, col = "Black", size = 4, fontface = "bold", min.segment.length = 0, segment.size = 1, box.padding = 0.5) +
+    coord_cartesian(ylim = c(-0.25,0.25))
+
+```
+
+## GO enrichment
+
+```{r,  GO}
+
+dbs <- c("GO_Molecular_Function_2018", "GO_Cellular_Component_2018", "GO_Biological_Process_2018" , "ChEA_2016" ,"KEGG_2019_Human")
+
+mart <- useMart("ENSEMBL_MART_ENSEMBL",
+                dataset = "hsapiens_gene_ensembl",
+                host='www.ensembl.org')
+
+pos_gene_name <- getBM(attributes=c('ensembl_gene_id',
+                   'external_gene_name'),
+      filters = "ensembl_gene_id",
+      values = pos_genes,
+      mart = mart) %>% pull(., external_gene_name)
+neg_gene_name <- getBM(attributes=c('ensembl_gene_id',
+                   'external_gene_name'),
+      filters = "ensembl_gene_id",
+      values = neg_genes,
+      mart = mart) %>% pull(., external_gene_name)
+
+pos <- enrichr(pos_gene_name, dbs)
+neg <- enrichr(neg_gene_name, dbs)
+
+pos[["GO_Biological_Process_2018"]] %>% as_tibble() %>% filter(Adjusted.P.value < 0.05) %>% arrange(Adjusted.P.value, P.value) %>% head(20) %>% dplyr::select(Term, Overlap, P.value, Adjusted.P.value)
+pos[["GO_Cellular_Component_2018"]] %>% as_tibble() %>% filter(Adjusted.P.value < 0.05) %>% arrange(Adjusted.P.value, P.value) %>% head(20) %>% dplyr::select(Term, Overlap, P.value, Adjusted.P.value)
+pos[["GO_Molecular_Function_2018"]] %>% as_tibble() %>% filter(Adjusted.P.value < 0.05) %>% arrange(Adjusted.P.value, P.value) %>% head(20) %>% dplyr::select(Term, Overlap, P.value, Adjusted.P.value)
+
+neg[["GO_Biological_Process_2018"]] %>% as_tibble() %>% filter(Adjusted.P.value < 0.05) %>% arrange(Adjusted.P.value, P.value) %>% head(20) %>% dplyr::select(Term, Overlap, P.value, Adjusted.P.value)
+neg[["GO_Cellular_Component_2018"]] %>% as_tibble() %>% filter(Adjusted.P.value < 0.05) %>% arrange(Adjusted.P.value, P.value) %>% head(20) %>% dplyr::select(Term, Overlap, P.value, Adjusted.P.value)
+neg[["GO_Molecular_Function_2018"]] %>% as_tibble() %>% filter(Adjusted.P.value < 0.05) %>% arrange(Adjusted.P.value, P.value) %>% head(20) %>% dplyr::select(Term, Overlap, P.value, Adjusted.P.value)
+
+```
+
+## Micro RNA enrichments?
+
+```{r, miRNAs}
+#pos_miRNA <- mget(pos_entrez[pos_entrez %in% ls(targetscan.Hs.egTARGETS)], targetscan.Hs.egTARGETS) %>% unlist() %>% tibble("gene" = names(.), "miRNA" = .) %>% group_by(miRNA) %>% summarize(pos = n())
+#neg_miRNA <- mget(neg_entrez[neg_entrez %in% ls(targetscan.Hs.egTARGETS)], targetscan.Hs.egTARGETS) %>% unlist() %>% tibble("gene" = names(.), "miRNA" = .) %>% group_by(miRNA) %>% summarize(neg = n())
+#ctrl_miRNA <- mget(ctrl_entrez[ctrl_entrez %in% ls(targetscan.Hs.egTARGETS)], targetscan.Hs.egTARGETS) %>% unlist() %>% tibble("gene" = names(.), "miRNA" = .) %>% group_by(miRNA) %>% summarize(ctrl = n())
+
+#all_miRNA <- full_join(pos_miRNA, neg_miRNA) %>% full_join(., ctrl_miRNA)
+
+miRNA_compare <- function(case_DNAStringSet, ctrl_DNAStringSet){
+  #Seqs roundabout from miRBase.org through the microRNA R package and this dead link: http://microrna.sanger.ac.uk/sequences/index.shtml
+  
+  #seeds <- hsSeqs %>% seedRegions() %>% RNAStringSet() %>% reverseComplement() %>% as.character()
+  seeds_Set <- readDNAStringSet("hs_microRNA_seed_revcomp_seqs.fa")
+  #seeds_Set <- gsub(pattern = "U", replacement = "T", microRNA::seedRegions(hsSeqs)) %>% DNAStringSet() %>% reverseComplement()
+  
+  fisher <- function(a, b, c, d){
+    mat <- matrix(c(a, b, c, d), nr = 2)
+    fisher.test(mat, alternative = "two.sided")$p.value
+  }
+
+ #case_miRNA <- matchSeeds(seeds,as.character(case_DNAStringSet)) %>% unlist() %>% tibble("name" = names(.), "value" = .) %>% separate(name, into = c("miRNA", "Gene"), sep = "\\.") %>% separate(Gene, into = c("Gene", "UTR"), sep = "_") %>% group_by(miRNA) %>% summarize(cts = n(), freq = n()/ sum(width(case_DNAStringSet)))
+  
+  #ctrl_miRNA <- matchSeeds(seeds,as.character(ctrl_DNAStringSet)) %>% unlist() %>% tibble("name" = names(.), "value" = .) %>% separate(name, into = c("miRNA", "Gene"), sep = "\\.") %>% separate(Gene, into = c("Gene", "UTR"), sep = "_") %>% group_by(miRNA) %>% summarize(cts = n(), freq = n()/ sum(width(ctrl_DNAStringSet)))
+  
+  #miRNA <- left_join(case_miRNA, ctrl_miRNA, by = "miRNA") %>% mutate(log2FC = log2(freq.x / freq.y), case_tot = sum(cts.x)-cts.x, ctrl_tot = sum(cts.y)-cts.y) %>% rowwise() %>% mutate(pval = fisher(cts.x, cts.y, case_tot, ctrl_tot), p_adj = p.adjust(pval, method = "BH", nrow(.))) %>% ungroup %>% arrange(p_adj)
+  
+  case_miRNA <- tibble(miRNA = names(seeds_Set), cts = rowSums(vcountPDict(seeds_Set, case_DNAStringSet, max.mismatch = 1))) %>% mutate(freq = cts/ sum(width(case_DNAStringSet)))
+  ctrl_miRNA <- tibble(miRNA = names(seeds_Set), cts = rowSums(vcountPDict(seeds_Set, ctrl_DNAStringSet, max.mismatch = 1))) %>% mutate(freq = cts/ sum(width(ctrl_DNAStringSet)))
+  
+  miRNA <- left_join(case_miRNA, ctrl_miRNA, by = "miRNA") %>% mutate(log2FC = log2(freq.x / freq.y), case_tot = sum(cts.x)-cts.x, ctrl_tot = sum(cts.y)-cts.y) %>% rowwise() %>% mutate(pval = fisher(cts.x, cts.y, case_tot, ctrl_tot), p_adj = p.adjust(pval, method = "BH", nrow(.))) %>% ungroup %>% arrange(p_adj)
+  
+  return(miRNA)
+}
+
+miRNA_plot <- function(miRNA_stats){
+  p <- miRNA_stats %>% dplyr::mutate(sig = ifelse(p_adj < 0.05, "0.05", "ns"))
+  p %>% ggplot2::ggplot(ggplot2::aes(x = log2FC, y = -log(p_adj), alpha = sig, col = sig)) +
+    ggplot2::geom_point() +
+    ggplot2::scale_color_manual(values = c("Red", "Black")) +
+    ggplot2::scale_alpha_manual(values = c(1, 0.1)) +
+    ggplot2::geom_text(data = subset(p, sig == "0.05"), ggplot2::aes(label = miRNA), nudge_y = 1) +
+    cowplot::theme_cowplot()
+}
+
+pos_proxvdist_miRNA <- miRNA_compare(pos_prox, pos_dist)
+miRNA_plot(pos_proxvdist_miRNA) + ggtitle("miRNA seeds in positive UTRs (prox v dist)")
+neg_proxvdist_miRNA <- miRNA_compare(neg_prox, neg_dist)
+miRNA_plot(neg_proxvdist_miRNA) + ggtitle("miRNA seeds in negative UTRs (prox v dist)")
+
+##dist v prox
+pos_distvprox_miRNA <- miRNA_compare(pos_dist, pos_prox)
+miRNA_plot(pos_distvprox_miRNA) + ggtitle("miRNA seeds in positive UTRs (dist v prox)")
+neg_distvprox_miRNA <- miRNA_compare(neg_dist, neg_prox)
+miRNA_plot(neg_distvprox_miRNA) + ggtitle("miRNA seeds in negative UTRs (dist v prox)")
+ctrl_distvprox_miRNA <- miRNA_compare(ctrl_dist, ctrl_prox)
+miRNA_plot(ctrl_distvprox_miRNA) + ggtitle("miRNA seeds in ControlUTRs (dist v prox)")
+
+###BreslowDay
+BDT_pos_miRNA <- left_join(pos_distvprox_miRNA, ctrl_distvprox_miRNA, by = "miRNA") %>% 
+  na.omit() %>%  
+  rowwise() %>%
+  mutate(ror_den = log2(freq.x.x/freq.y.x)-log2(freq.y.x/freq.y.y),
+         ror_cts = log2(cts.x.x/cts.y.x)-log2(cts.y.x/cts.y.y),
+         BDT_pval_cts = BreslowDayTest(contingency_cube(as.numeric(cts.x.x), as.numeric(case_tot.x), as.numeric(cts.y.x), as.numeric(ctrl_tot.x), as.numeric(cts.x.y), as.numeric(case_tot.y), as.numeric(cts.y.y), as.numeric(ctrl_tot.y)))[[3]]) %>% 
+  ungroup() %>% 
+  mutate(BDT_padj_cts = p.adjust(.$BDT_pval_cts, method = "BH")) %>%
+  dplyr::select(miRNA, ror_den, ror_cts, BDT_pval_cts, BDT_padj_cts) %>% 
+  arrange(BDT_padj_cts)
+
+p <- BDT_pos_miRNA %>% mutate(sig = ifelse(BDT_padj_cts < 0.05, "< 0.05", "ns")) 
+p %>% ggplot(aes(x = ror_cts, y = -log(BDT_padj_cts), col = sig, alpha = sig)) +
+  geom_point() + 
+  scale_color_manual(values = c("Red", "Black")) +
+  scale_alpha_manual(values = c(1,0.1)) +
+  geom_text(data = subset(p, sig == "< 0.05"), aes(label = miRNA), nudge_y = 0.5) +
+  theme_cowplot() +
+  labs(x = "log2(pos_dist/pos_prox) - log2(ctrl_dist/ctrl_prox)", 
+       title = "BreslowDay Positive Dist/Prox",
+       subtitle = "Counts")
+
+BDT_neg_miRNA <- left_join(neg_distvprox_miRNA, ctrl_distvprox_miRNA, by = "miRNA") %>% 
+  na.omit() %>%  
+  rowwise() %>%
+  mutate(ror_den = log2(freq.x.x/freq.y.x)-log2(freq.y.x/freq.y.y),
+         ror_cts = log2(cts.x.x/cts.y.x)-log2(cts.y.x/cts.y.y),
+         BDT_pval_cts = BreslowDayTest(contingency_cube(as.numeric(cts.x.x), as.numeric(case_tot.x), as.numeric(cts.y.x), as.numeric(ctrl_tot.x), as.numeric(cts.x.y), as.numeric(case_tot.y), as.numeric(cts.y.y), as.numeric(ctrl_tot.y)))[[3]]) %>% 
+  ungroup() %>% 
+  mutate(BDT_padj_cts = p.adjust(BDT_pval_cts, method = "BH")) %>%
+  dplyr::select(miRNA,ror_den, ror_cts, BDT_pval_cts, BDT_padj_cts) %>%  
+  arrange(BDT_padj_cts)
+
+p <- BDT_neg_miRNA %>% mutate(sig = ifelse(BDT_padj_cts < 0.05, "< 0.05", "ns")) 
+p %>% ggplot(aes(x = ror_cts, y = -log(BDT_padj_cts), col = sig, alpha = sig)) +
+  geom_point() + 
+  scale_color_manual(values = c("Red", "Black")) +
+  scale_alpha_manual(values = c(1,0.1)) +
+  geom_text(data = subset(p, sig == "< 0.05"), aes(label = miRNA), nudge_y = 0.5) +
+  theme_cowplot() +
+  labs(x = "log2(neg_dist/neg_prox) - log2(ctrl_dist/ctrl_prox)", 
+       title = "BreslowDay Negative Dist/Prox",
+       subtitle = "Counts")
+
+p <- left_join(BDT_pos_miRNA, BDT_neg_miRNA, by = "miRNA") %>% 
+  mutate(miRNA = substr(miRNA, 9, nchar(miRNA)),
+         sig = ifelse(BDT_padj_cts.y < 0.05 & BDT_padj_cts.x < 0.05, "2", ifelse(BDT_padj_cts.y < 0.05 | BDT_padj_cts.x < 0.05, "1", "0")), labeled = ifelse(sig == 1, T, F))
+  
+p %>% ggplot(aes(x = ror_cts.y, y = ror_cts.x)) + 
+  geom_point(aes(shape = sig, col = sig, size = sig)) + 
+  theme_cowplot() +
+  labs(x = "log2(neg_dist/neg_prox) - log2(ctrl_dist/ctrl_prox)", 
+       y = "log2(pos_dist/pos_prox) - log2(ctrl_dist/ctrl_prox)",
+       title = "miRNA enrichment",
+       subtitle = "Counts") +
+  scale_color_manual(values = c("black", "#2D708EFF", "#3CBB75FF")) +
+  scale_shape_manual(values = c(20, 1, 10)) +
+  scale_size_manual(values = c(1, 3, 3)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  ggrepel::geom_text_repel(data = subset(p, labeled == "TRUE"), aes(label = miRNA), nudge_y = 0.025, col = "#2D708EFF")
+
+p %>% ggplot(aes(x = ror_den.y, y = ror_den.x)) + 
+  geom_point(aes(shape = sig, col = sig, size = sig)) + 
+  theme_cowplot() +
+  labs(x = "log2(neg_dist/neg_prox) - log2(ctrl_dist/ctrl_prox)", 
+       y = "log2(pos_dist/pos_prox) - log2(ctrl_dist/ctrl_prox)",
+       title = "miRNA enrichment",
+       subtitle = "Density") +
+  scale_color_manual(values = c("black", "#2D708EFF", "#3CBB75FF")) +
+  scale_shape_manual(values = c(20, 1, 10)) +
+  scale_size_manual(values = c(1, 3, 3)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  ggrepel::geom_text_repel(data = subset(p, labeled == "TRUE"), aes(label = miRNA), nudge_y = 0.025, col = "#2D708EFF")
+
+
+left_join(BDT_pos_miRNA, BDT_neg_miRNA, by = "miRNA") %>% 
+  mutate(sig = ifelse(BDT_padj_cts.y < 0.05 & BDT_padj_cts.x < 0.05, "2", ifelse(BDT_padj_cts.y < 0.05 | BDT_padj_cts.x < 0.05, "1", "0"))) %>% filter(sig == 1, (ror_cts.y < 0 & ror_cts.x > 0) | (ror_cts.y > 0 & ror_cts.x < 0)) %>% arrange(ror_cts.y)
+
+###
+
+pos_prox_miRNA <- miRNA_compare(pos_prox, ctrl_prox)
+pos_prox_miRNA %>% mutate(miRNA = substr(miRNA, 9, nchar(miRNA))) %>% miRNA_plot() + ggtitle("miRNA seeds in positive proximal UTRs")
+neg_prox_miRNA <- miRNA_compare(neg_prox, ctrl_prox)
+neg_prox_miRNA %>% mutate(miRNA = substr(miRNA, 9, nchar(miRNA))) %>% miRNA_plot() + ggtitle("miRNA seeds in negative proximal UTRs")
+
+pos_dist_miRNA <- miRNA_compare(pos_dist, ctrl_dist)
+pos_dist_miRNA %>% mutate(miRNA = substr(miRNA, 9, nchar(miRNA))) %>% miRNA_plot() + ggtitle("miRNA seeds in positive distal UTRs")
+neg_dist_miRNA <- miRNA_compare(neg_dist, ctrl_dist)
+neg_dist_miRNA %>% mutate(miRNA = substr(miRNA, 9, nchar(miRNA))) %>% miRNA_plot() + ggtitle("miRNA seeds in negative distal UTRs")
+
+
+#miRNA content overall
+
+pos_distvprox_miRNA %>% 
+  dplyr::rename("pos_dist_freq" = freq.x, "pos_prox_freq" = freq.y) %>% 
+  left_join(neg_distvprox_miRNA, by = "miRNA") %>% 
+  dplyr::rename("neg_dist_freq" = freq.x, "neg_prox_freq" = freq.y) %>%
+  left_join(ctrl_distvprox_miRNA, by = "miRNA") %>% 
+  dplyr::rename("ctrl_dist_freq" = freq.x, "ctrl_prox_freq" = freq.y) %>% 
+  dplyr::select(miRNA, pos_dist_freq, pos_prox_freq, neg_dist_freq, neg_prox_freq, ctrl_dist_freq, ctrl_prox_freq) %>%
+  gather(-miRNA, key = sample, value = frequency) %>% 
+  separate(sample, into = c("gene_set", "UTR", "freq"), sep = "_") %>% 
+  mutate(gene_set = ifelse(gene_set == "pos", "Positively Correlated", 
+                           ifelse(gene_set == "neg", "Negatively Correlated", "Control Genes"))) %>% 
+  ggplot(aes(x = gene_set, y = frequency, fill = gene_set)) +
+  geom_violin() + 
+  geom_boxplot(width = 0.15, outlier.alpha = FALSE) + 
+  theme_cowplot() + 
+  facet_wrap(.~factor(UTR, levels = c("prox", "dist"), labels = c("Proximal", "Distal")), nrow = 2) +
+  labs(x = "", title = "miRNA content") +
+  scale_fill_manual(values = c("#cfd0e4", "#57b9be", "#e0a6f2"))  +
+  theme(strip.background = element_rect(color = "white", fill = "white"),
+        strip.text.x = element_text(size = 12, color = "Black", face = "bold")) +
+  scale_x_discrete(limits = c("Negatively Correlated", "Control Genes", "Positively Correlated")) + 
+  stat_compare_means(comparisons = comp, method = "wilcox.test", label.y = 0.017) +
+  guides(fill = FALSE)
+
+```
+
+## miRNA summary
+miR-637 is generally depleted from negatively correlated genes
+
+miR-642 is depleted in negatively correlated distal UTRS AND enriched in positively correlated proximal UTRS
+These are both UTR types expected to be unstable
+
+## ARE enrichment
+
+```{r, }
+#AREs from http://rna.tbi.univie.ac.at/AREsite2
+
+#AREs <- list(ATTTA = universalmotif::create_motif("ATTTA", type = "PPM")["motif"], 
+#             WTTTW = universalmotif::create_motif("WTTTW", type = "PPM")["motif"], 
+#             GTTTG = universalmotif::create_motif("GTTTG", type = "PPM")["motif"], 
+#             TTTTT = universalmotif::create_motif("TTTTT", type = "PPM")["motif"], 
+#             WWTTTWW = universalmotif::create_motif("WWTTTWW", type = "PPM")["motif"],
+#             WWWTTTWWW = universalmotif::create_motif("WWWTTTWWW", type = "PPM")["motif"],
+#             WWWWTTTWWWW = universalmotif::create_motif("WWWWTTTWWWW", type = "PPM")["motif"],
+#             WWWWWTTTWWWWW = universalmotif::create_motif("WWWWWTTTWWWWW", type = "PPM")["motif"], 
+#             WTTKTTW = universalmotif::create_motif("WTTKTTW", type = "PPM")["motif"], 
+#             WTTSTTW = universalmotif::create_motif("WTTSTTW", type = "PPM")["motif"], 
+#             WTTNTTW = universalmotif::create_motif("WTTNTTW", type = "PPM")["motif"], 
+#             AWTAAA = universalmotif::create_motif("AWTAAA", type = "PPM")["motif"])
+
+AREs <- readRDS("ARE_PWM")
+
+pos_proxvdist_AREs <- motif_compare(AREs, pos_prox, pos_dist) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+pos_proxvdist_AREs %>% dplyr::rename("prox" = case, "prox_freq" = case_freq, "prox_tot" = case_tot, "dist" = ctrl, "dist_freq" = ctrl_freq, "dist_tot" = ctrl_tot, "log2(prox/dist)" = log2FC)
+pos_proxvdist_AREs %>% motif_plot(.) + ggtitle("Positive Correlated UTRs (prox v dist)") + labs(x = "log2(prox/dist)")
+neg_proxvdist_AREs <- motif_compare(AREs, neg_prox, neg_dist) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+neg_proxvdist_AREs %>% dplyr::rename("prox" = case, "prox_freq" = case_freq, "prox_tot" = case_tot, "dist" = ctrl, "dist_freq" = ctrl_freq, "dist_tot" = ctrl_tot, "log2(prox/dist)" = log2FC)
+neg_proxvdist_AREs %>% motif_plot(.) + ggtitle("Negative Correlated UTRs (prox v dist)") + labs(x = "log2(prox/dist)")
+
+##dist v prox
+
+pos_distvprox_AREs <- motif_compare(AREs, pos_dist, pos_prox) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+pos_distvprox_AREs %>% dplyr::rename("dist" = case, "dist_freq" = case_freq, "dist_tot" = case_tot, "prox" = ctrl, "prox_freq" = ctrl_freq, "prox_tot" = ctrl_tot, "log2(dist/prox)" = log2FC)
+pos_distvprox_AREs %>% motif_plot(.) + ggtitle("Positive Correlated UTRs (dist v prox)") + labs(x = "log2(dist/prox)")
+neg_distvprox_AREs <- motif_compare(AREs, neg_dist, neg_prox) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+neg_distvprox_AREs %>% dplyr::rename("dist" = case, "dist_freq" = case_freq, "dist_tot" = case_tot, "prox" = ctrl, "prox_freq" = ctrl_freq, "prox_tot" = ctrl_tot, "log2(dist/prox)" = log2FC)
+neg_distvprox_AREs %>% motif_plot(.) + ggtitle("Negative Correlated UTRs (dist v prox)") + labs(x = "log2(dist/prox)")
+ctrl_distvprox_AREs <- motif_compare(AREs, ctrl_dist, ctrl_prox) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+ctrl_distvprox_AREs %>% dplyr::rename("dist" = case, "dist_freq" = case_freq, "dist_tot" = case_tot, "prox" = ctrl, "prox_freq" = ctrl_freq, "prox_tot" = ctrl_tot, "log2(dist/prox)" = log2FC)
+ctrl_distvprox_AREs %>% motif_plot(.) + ggtitle("Control Gene UTRs (dist v prox)") + labs(x = "log2(dist/prox)")
+
+###BreslowDay
+BDT_pos_ARE <- left_join(pos_distvprox_AREs, ctrl_distvprox_AREs, by = "motif") %>% 
+  na.omit() %>%  
+  rowwise() %>%
+  mutate(ctrl_freq.x = ctrl.x/sum(width(pos_prox)),
+         case_freq.x = case.x/sum(width(pos_dist)),
+         ctrl_freq.y = ctrl.y/sum(width(ctrl_prox)),
+         case_freq.y = case.y/sum(width(ctrl_dist)),
+         ror_den = log2(case_freq.x/ctrl_freq.x)-log2(case_freq.y/ctrl_freq.y),
+         ror_cts = log2(case.x/ctrl.x) - log2(case.y/ctrl.y),  
+         BDT_pval_cts = BreslowDayTest(contingency_cube(as.numeric(case.x), as.numeric(case_tot.x), as.numeric(ctrl.x), as.numeric(ctrl_tot.x), as.numeric(case.y), as.numeric(case_tot.y), as.numeric(ctrl.y), as.numeric(ctrl_tot.y)))[[3]]) %>% 
+  ungroup() %>% 
+  mutate(BDT_padj_cts = p.adjust(.$BDT_pval_cts, method = "BH")) %>%
+  dplyr::select(motif, ror_den, ror_cts, BDT_pval_cts, BDT_padj_cts) %>%  
+  arrange(BDT_padj_cts)
+
+p <- BDT_pos_ARE %>% mutate(sig = ifelse(BDT_padj_cts < 0.05, "< 0.05", "ns")) 
+p %>% ggplot(aes(x = ror_cts, y = -log(BDT_padj_cts), col = sig, alpha = sig)) +
+  geom_point() + 
+  scale_color_manual(values = c("Red", "Black")) +
+  scale_alpha_manual(values = c(1,0.1)) +
+  geom_text(data = subset(p, sig == "< 0.05"), aes(label = motif), nudge_y = 0.5) +
+  theme_cowplot() +
+  labs(x = "log2(pos_dist/pos_prox) - log2(ctrl_dist/ctrl_prox)",
+       title = "BreslowDay Positive Dist/Prox",
+       subtitle = "Counts")
+
+BDT_neg_ARE <- left_join(neg_distvprox_AREs, ctrl_distvprox_AREs, by = "motif") %>% 
+  na.omit() %>%  
+  rowwise() %>%
+  mutate(ctrl_freq.x = ctrl.x/sum(width(neg_prox)),
+         case_freq.x = case.x/sum(width(neg_dist)),
+         ctrl_freq.y = ctrl.y/sum(width(ctrl_prox)),
+         case_freq.y = case.y/sum(width(ctrl_dist)),
+         ror_den = log2(case_freq.x/ctrl_freq.x)-log2(case_freq.y/ctrl_freq.y),
+         ror_cts = log2(case.x/ctrl.x) - log2(case.y/ctrl.y), 
+         BDT_pval_cts = BreslowDayTest(contingency_cube(as.numeric(case.x), as.numeric(case_tot.x), as.numeric(ctrl.x), as.numeric(ctrl_tot.x), as.numeric(case.y), as.numeric(case_tot.y), as.numeric(ctrl.y), as.numeric(ctrl_tot.y)))[[3]]) %>% 
+  ungroup() %>% 
+  mutate(BDT_padj_cts = p.adjust(.$BDT_pval_cts, method = "BH")) %>%
+  dplyr::select(motif, ror_den, ror_cts, BDT_pval_cts, BDT_padj_cts) %>% 
+  arrange(BDT_padj_cts)
+
+p <- BDT_neg_ARE %>% mutate(sig = ifelse(BDT_padj_cts < 0.05, "< 0.05", "ns")) 
+p %>% ggplot(aes(x = ror_cts, y = -log(BDT_padj_cts), col = sig, alpha = sig)) +
+  geom_point() + 
+  scale_color_manual(values = c("Red", "Black")) +
+  scale_alpha_manual(values = c(1,0.1)) +
+  geom_text(data = subset(p, sig == "< 0.05"), aes(label = motif), nudge_y = 0.5) +
+  theme_cowplot() +
+  labs(x = "log2(neg_dist/neg_prox) - log2(ctrl_dist/ctrl_prox)", 
+       title = "BreslowDay Negative Dist/Prox",
+       subtitle = "Counts")
+
+p <- left_join(BDT_pos_ARE, BDT_neg_ARE, by = "motif") %>% 
+  mutate(sig = ifelse(BDT_padj_cts.y < 0.05 & BDT_padj_cts.x < 0.05, "2", ifelse(BDT_padj_cts.y < 0.05 | BDT_padj_cts.x < 0.05, "1", "0")), labeled = ifelse(sig == 1, T, F))
+p %>% ggplot(aes(x = ror_cts.y, y = ror_cts.x)) + 
+  geom_point(aes(shape = sig, col = sig, size = sig)) + 
+  theme_cowplot() +
+  labs(x = "log2(neg_dist/neg_prox) - log2(ctrl_dist/ctrl_prox)", 
+       y = "log2(pos_dist/pos_prox) - log2(ctrl_dist/ctrl_prox)",
+       title = "AREs enrichment",
+       subtitle = "Counts") +
+  scale_color_manual(values = c("black", "#2D708EFF", "#3CBB75FF")) +
+  scale_shape_manual(values = c(20, 1, 10)) +
+  scale_size_manual(values = c(1, 3, 3)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_text(data = subset(p, labeled == "TRUE"), aes(label = motif), nudge_y = 0.025, col = "#3CBB75FF")
+
+p %>% ggplot(aes(x = ror_den.y, y = ror_den.x)) + 
+  geom_point(aes(shape = sig, col = sig, size = sig)) + 
+  theme_cowplot() +
+  labs(x = "log2(neg_dist/neg_prox) - log2(ctrl_dist/ctrl_prox)", 
+       y = "log2(pos_dist/pos_prox) - log2(ctrl_dist/ctrl_prox)",
+       title = "AREs enrichment",
+       subtitle = "Density") +
+  scale_color_manual(values = c("black", "#2D708EFF", "#3CBB75FF")) +
+  scale_shape_manual(values = c(20, 1, 10)) +
+  scale_size_manual(values = c(1, 3, 3)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_text(data = subset(p, labeled == "TRUE"), aes(label = motif), nudge_y = 0.025, col = "#3CBB75FF")
+
+left_join(BDT_pos_ARE, BDT_neg_ARE, by = "motif") %>% 
+  mutate(sig = ifelse(BDT_padj_cts.y < 0.05 & BDT_padj_cts.x < 0.05, "2", ifelse(BDT_padj_cts.y < 0.05 | BDT_padj_cts.x < 0.05, "1", "0"))) %>% filter(sig == 1, (ror_cts.y < 0 & ror_cts.x > 0) | (ror_cts.y > 0 & ror_cts.x < 0)) %>% arrange(ror_cts.y)
+###
+
+posvctrl_prox_AREs <- motif_compare(AREs, pos_prox, ctrl_prox) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+posvctrl_prox_AREs %>% dplyr::rename("pos" = case, "pos_freq" = case_freq, "pos_tot" = case_tot, "log2(case/ctrl)" = log2FC) #6s
+posvctrl_prox_AREs %>% motif_plot(.) + ggtitle("Positive Correlated Proximal UTRs") + labs(x = "log2(pos/ctrl)")
+
+negvctrl_prox_AREs <- motif_compare(AREs, neg_prox, ctrl_prox) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+negvctrl_prox_AREs %>% dplyr::rename("neg" = case, "neg_freq" = case_freq, "neg_tot" = case_tot, "log2(case/ctrl)" = log2FC) #6s
+negvctrl_prox_AREs %>% motif_plot(.) + ggtitle("Negative Correlated Proximal UTRs") + labs(x = "log2(neg/ctrl)")
+
+posvctrl_dist_AREs <- motif_compare(AREs, pos_dist, ctrl_dist) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+posvctrl_dist_AREs %>% dplyr::rename("pos" = case, "pos_freq" = case_freq, "pos_tot" = case_tot, "log2(case/ctrl)" = log2FC) #6s
+posvctrl_dist_AREs %>% motif_plot(.) + ggtitle("Positive Correlated Distal UTRs") + labs(x = "log2(pos/ctrl)")
+
+negvctrl_dist_AREs <- motif_compare(AREs, neg_dist, ctrl_dist) %>% mutate(p_adj = p.adjust(pval, method = "BH"))
+negvctrl_dist_AREs %>% dplyr::rename("neg" = case, "neg_freq" = case_freq, "neg_tot" = case_tot, "log2(case/ctrl)" = log2FC) #6s
+negvctrl_dist_AREs %>% motif_plot(.) + ggtitle("Negative Correlated Distal UTRs") + labs(x = "log2(neg/ctrl)")
+
+ARE_dist <- left_join(posvctrl_dist_AREs, negvctrl_dist_AREs, by = "motif") %>% 
+  mutate(ctrl_freq.x = ctrl.x/sum(width(ctrl_dist)),
+         case_freq.x = case.x/sum(width(pos_dist)),
+         ctrl_freq.y = ctrl.y/sum(width(ctrl_dist)),
+         case_freq.y = case.y/sum(width(neg_dist)),
+         sig = ifelse(p_adj.y < 0.05 & p_adj.x < 0.05, "2", ifelse(p_adj.y < 0.05 | p_adj.x < 0.05, "1", "0")),
+         labeled = ifelse(sig == 2, T, F))
+
+ARE_dist %>% ggplot(aes(x = log2(case_freq.y/ctrl_freq.y), y = log2(case_freq.x/ctrl_freq.x), label = motif)) + 
+  geom_point(aes(col = sig, shape = sig, size = sig)) + 
+  theme_cowplot() +
+  labs(x = "log2(neg_dist/ctrl_dist)", 
+       y = "log2(pos_dist/ctrl_dist)",
+       title = "ARE Distal UTR enrichment", subtitle = "Density") +
+  scale_color_manual(values = viridis::viridis(4)) +
+  scale_shape_manual(values = c(20, 1, 10)) +
+  scale_size_manual(values = c(1, 3, 3)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed")  +
+  ggrepel::geom_text_repel(data = subset(ARE_dist, labeled == "TRUE"), nudge_y = 0.025, col = "Black")
+
+ARE_prox <- left_join(posvctrl_prox_AREs, negvctrl_prox_AREs, by = "motif") %>% 
+  mutate(ctrl_freq.x = ctrl.x/sum(width(ctrl_prox)),
+         case_freq.x = case.x/sum(width(pos_prox)),
+         ctrl_freq.y = ctrl.y/sum(width(ctrl_prox)),
+         case_freq.y = case.y/sum(width(neg_prox)),
+         sig = ifelse(p_adj.y < 0.05 & p_adj.x < 0.05, "2", ifelse(p_adj.y < 0.05 | p_adj.x < 0.05, "1", "0")),
+         labeled = ifelse(sig == 2, T, F))
+
+ARE_dist %>% ggplot(aes(x = log2(case_freq.y/ctrl_freq.y), y = log2(case_freq.x/ctrl_freq.x), label = motif)) + 
+  geom_point(aes(col = sig, shape = sig, size = sig)) + 
+  theme_cowplot() +
+  labs(x = "log2(neg_prox/ctrl_prox)", 
+       y = "log2(pos_prox/ctrl_prox)",
+       title = "ARE Proxmial UTR enrichment", subtitle = "Density") +
+  scale_color_manual(values = viridis::viridis(4)) +
+  scale_shape_manual(values = c(20, 1, 10)) +
+  scale_size_manual(values = c(1, 3, 3)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed")  +
+  ggrepel::geom_text_repel(data = subset(ARE_prox, labeled == "TRUE"), nudge_y = 0.025, col = "Black")
+
+#ARE content overall
+
+pos_distvprox_AREs %>% 
+  dplyr::rename("pos_dist_freq" = case_freq, "pos_prox_freq" = ctrl_freq) %>% 
+  left_join(neg_distvprox_AREs, by = "motif") %>% 
+  dplyr::rename("neg_dist_freq" = case_freq, "neg_prox_freq" = ctrl_freq) %>%
+  left_join(ctrl_distvprox_AREs, by = "motif") %>% 
+  dplyr::rename("ctrl_dist_freq" = case_freq, "ctrl_prox_freq" = ctrl_freq) %>% 
+  dplyr::select(motif, pos_dist_freq, pos_prox_freq, neg_dist_freq, neg_prox_freq, ctrl_dist_freq, ctrl_prox_freq) %>%
+  gather(-motif, key = sample, value = frequency) %>% 
+  separate(sample, into = c("gene_set", "UTR", "freq"), sep = "_") %>% 
+  mutate(gene_set = ifelse(gene_set == "pos", "Positively Correlated", 
+                           ifelse(gene_set == "neg", "Negatively Correlated", "Control Genes"))) %>% 
+  ggplot(aes(x = gene_set, y = frequency, fill = gene_set)) +
+  geom_violin() + 
+  geom_boxplot(width = 0.15, outlier.alpha = FALSE) + 
+  theme_cowplot() + 
+  facet_wrap(.~factor(UTR, levels = c("prox", "dist"), labels = c("Proximal", "Distal")), nrow = 2) +
+  labs(x = "", title = "ARE content") +
+  scale_fill_manual(values = c("#cfd0e4", "#57b9be", "#e0a6f2"))  +
+  theme(strip.background = element_rect(color = "white", fill = "white"),
+        strip.text.x = element_text(size = 12, color = "Black", face = "bold")) +
+  scale_x_discrete(limits = c("Negatively Correlated", "Control Genes", "Positively Correlated")) + 
+  stat_compare_means(comparisons = comp, method = "wilcox.test", label.y = 0.07) +
+  guides(fill = FALSE)
+
+###unique ARES
+
+AREs_unique <- list(ATTTA = universalmotif::create_motif("ATTTA", type = "PPM")["motif"], 
+             TTTTT = universalmotif::create_motif("TTTTT", type = "PPM")["motif"], 
+             WWTTTWW = universalmotif::create_motif("WWTTTWW", type = "PPM")["motif"], 
+             WTTNTTW = universalmotif::create_motif("WTTNTTW", type = "PPM")["motif"], 
+             AWTAAA = universalmotif::create_motif("AWTAAA", type = "PPM")["motif"])
+
+a <- motif_by_gene(AREs_unique, pos_dist) %>% dplyr::select(-motif) %>% colSums() %>% tibble(gene = names(.), ARE = .) %>% mutate(len = width(pos_dist[gene]), ARE_freq = ARE/len, set = "pos") %>% dplyr::select(gene, ARE_freq, set)
+b <- motif_by_gene(AREs_unique, pos_prox) %>% dplyr::select(-motif) %>% colSums() %>% tibble(gene = names(.), ARE = .) %>% mutate(len = width(pos_prox[gene]), ARE_freq = ARE/len, set = "pos") %>% dplyr::select(gene, ARE_freq, set)
+c <- motif_by_gene(AREs_unique, neg_dist) %>% dplyr::select(-motif) %>% colSums() %>% tibble(gene = names(.), ARE = .) %>% mutate(len = width(neg_dist[gene]), ARE_freq = ARE/len, set = "neg") %>% dplyr::select(gene, ARE_freq, set)
+d <- motif_by_gene(AREs_unique, neg_prox) %>% dplyr::select(-motif) %>% colSums() %>% tibble(gene = names(.), ARE = .) %>% mutate(len = width(neg_prox[gene]), ARE_freq = ARE/len, set = "neg") %>% dplyr::select(gene, ARE_freq, set)
+e <- motif_by_gene(AREs_unique, ctrl_dist) %>% dplyr::select(-motif) %>% colSums() %>% tibble(gene = names(.), ARE = .) %>% mutate(len = width(ctrl_dist[gene]), ARE_freq = ARE/len, set = "ctrl") %>% dplyr::select(gene, ARE_freq, set)
+f <- motif_by_gene(AREs_unique, ctrl_prox) %>% dplyr::select(-motif) %>% colSums() %>% tibble(gene = names(.), ARE = .) %>% mutate(len = width(ctrl_prox[gene]), ARE_freq = ARE/len, set = "ctrl") %>% dplyr::select(gene, ARE_freq, set)
+
+bind_rows(a, b, c, d, e, f) %>%  
+  mutate(gene_set = ifelse(set == "pos", "Positively Correlated", 
+                           ifelse(set == "neg", "Negatively Correlated", "Control Genes")),
+         UTR = ifelse(grepl(pattern = "UTR0", gene), "prox", "dist")) %>% 
+  ggplot(aes(x = gene_set, y = ARE_freq, fill = gene_set)) +
+  geom_violin() + 
+  geom_boxplot(width = 0.15, outlier.alpha = FALSE) + 
+  theme_cowplot() + 
+  facet_wrap(.~factor(UTR, levels = c("prox", "dist"), labels = c("Proximal", "Distal")), nrow = 2) +
+  labs(x = "", title = "ARE content") +
+  scale_fill_manual(values = c("#cfd0e4", "#57b9be", "#e0a6f2"))  +
+  theme(strip.background = element_rect(color = "white", fill = "white"),
+        strip.text.x = element_text(size = 12, color = "Black", face = "bold")) +
+  scale_x_discrete(limits = c("Negatively Correlated", "Control Genes", "Positively Correlated")) + 
+  stat_compare_means(comparisons = comp, method = "wilcox.test", label.y =) +
+  guides(fill = FALSE)
+
+bind_rows(a, b, c, d, e, f) %>%  
+  mutate(gene_set = ifelse(set == "pos", "Positively Correlated", 
+                           ifelse(set == "neg", "Negatively Correlated", "Control Genes")),
+         UTR = ifelse(grepl(pattern = "UTR0", gene), "prox", "dist")) %>% 
+  filter(UTR == "dist") %>% 
+  ggplot(aes(x = gene_set, y = ARE_freq, fill = gene_set)) +
+  geom_violin() + 
+  geom_boxplot(width = 0.15, outlier.alpha = FALSE) + 
+  theme_cowplot() + 
+  labs(x = "", title = "ARE content", y = "Distal UTR ARE Density") +
+  scale_fill_manual(values = c("#cfd0e4", "#57b9be", "#e0a6f2")) +
+  scale_x_discrete(limits = c("Negatively Correlated", "Control Genes", "Positively Correlated")) + 
+  stat_compare_means(comparisons = comp, method = "wilcox.test", label.y = c(0.5, 0.65)) +
+  guides(fill = FALSE) +
+  ylim(0,0.75)
+
+bind_rows(a, b, c, d, e, f) %>%  
+  mutate(gene_set = ifelse(set == "pos", "Positively Correlated", 
+                           ifelse(set == "neg", "Negatively Correlated", "Control Genes")),
+         UTR = ifelse(grepl(pattern = "UTR0", gene), "prox", "dist")) %>% 
+  ggplot(aes(x = factor(UTR, levels = c("prox", "dist"), labels = c("Proximal", "Distal")), y = ARE_freq, fill = UTR))+
+  geom_violin() + 
+  geom_boxplot(width = 0.15, outlier.alpha = FALSE) + 
+  theme_cowplot() + 
+  facet_wrap(.~factor(gene_set, levels = c("Negatively Correlated", "Control Genes", "Positively Correlated"))) +
+  labs(x = "", title = "ARE content") +
+  scale_fill_manual(values = c("#78dce8", "#fc9867"))  +
+  theme(strip.background = element_rect(color = "white", fill = "white"),
+        strip.text.x = element_text(size = 12, color = "Black", face = "bold"))  + 
+  stat_compare_means(method = "wilcox.test") +
+  guides(fill = FALSE) 
+
+```
+
+```{r, AREScore}
+pos_AREScore <- read.table("data/AREScore_pos_dist_results.txt", header = TRUE, sep = "\t") %>% as_tibble() %>% mutate(grp = "Positively Correlated")
+neg_AREScore <- read.table("data/AREScore_neg_dist_results.txt", header = TRUE, sep = "\t") %>% as_tibble() %>% mutate(grp = "Negatively Correlated")
+ctrl1_AREScore <- read.table("data/AREScore_ctrl_dist_1_results.txt", header = TRUE, sep = "\t") %>% as_tibble() %>% mutate(grp = "Control Genes")
+ctrl2_AREScore <- read.table("data/AREScore_ctrl_dist_2_results.txt", header = TRUE, sep = "\t") %>% as_tibble() %>% mutate(grp = "Control Genes")
+ctrl3_AREScore <- read.table("data/AREScore_ctrl_dist_3_results.txt", header = TRUE, sep = "\t") %>% as_tibble() %>% mutate(grp = "Control Genes")
+ctrl4_AREScore <- read.table("data/AREScore_ctrl_dist_4_results.txt", header = TRUE, sep = "\t") %>% as_tibble() %>% mutate(grp = "Control Genes")
+AREScore <- bind_rows(pos_AREScore, neg_AREScore, ctrl1_AREScore, ctrl2_AREScore, ctrl3_AREScore, ctrl4_AREScore) %>% dplyr::select(Score,grp)
+
+AREScore %>% ggplot(aes(x = factor(grp), y = Score, fill = grp)) +
+  geom_violin() + 
+  geom_boxplot(width = 0.05, outlier.alpha = FALSE, notch = TRUE) + 
+  theme_cowplot() +
+  labs(x = "", y = "Distal UTR AREScore") +
+  scale_fill_manual(values = c("#cfd0e4", "#57b9be", "#e0a6f2")) +
+  scale_x_discrete(limits = c("Negatively Correlated", "Control Genes", "Positively Correlated"), labels = c("Negatively\nCorrelated", "Control\nGenes", "Positively\nCorrelated")) + 
+  stat_compare_means(comparisons = comp, method = "wilcox.test", label.y = c(10,13)) +
+  guides(fill = FALSE) +
+  EnvStats::stat_n_text(y.pos = -0.75, size = 6) +
+  coord_cartesian(ylim = c(-1,15))
+
+```
+
+## ARE summary
+
+GTTG is depleted from postively correlated genes and enriched in negatively correlated genes
+
+*** WWTTTWW AREs are depleted from positively correlated distal UTRS but enriched in negatively correlated distal UTRs
+
+# Main Findings!!!
+
+Distal UTR length increases from Pos < Ctrl < Neg
+
+GC content overall increases from Neg < Ctrl < Pos
+
+Kmers refect GC content...
+
+RBP motifs are a mess...
+
+miR-642 is enriched in proximal UTRs of positive genes
+
+WWTTTWW AREs are depleted from +distal UTRs but enriched in -distal UTRs
+Distal UTRs of Negative genes seem AU rich in kmer and have many AU binding protein motifs enriched...
+
+
+```{r, make mouse unique utr coods txdb, echo = FALSE}
+
+##prepare polya gff
+#polya_gff <- rtracklayer::import("data/uniqueutrcoords.gencodecomprehensive.vM17.gff3")
+
+#only interested in genes with two alternative UTRs (this is true for ~50% of genes)
+#twoUTRids <- polya_gff %>% 
+#  as_tibble() %>% 
+#  filter(type == "uniqueUTR", 
+#         number_of_uniqueseqs == 2) %>% 
+#  mutate(tx_name = paste(str_match(ID, "(.*?)\\.(.*?)_uniqueUTR(.?)")[,2],
+#                         "_uniqueUTR",
+#                         str_match(ID, "(.*?)\\.(.*?)_uniqueUTR(.?)")[,4],
+#                         sep = "")) %>% 
+#  pull(., tx_name)
+
+
+##make txdb object
+##first create transcripts, splicings and gene dataframes with required functions
+#transcripts <- polya_gff %>% 
+#  as_tibble() %>% 
+#  filter(type == "uniqueUTR") %>% 
+#  mutate(tx_id = as.integer(paste(str_match(ID, "ENSMUSG(.*?)\\.(.*?)_uniqueUTR(.?)")[,2], 
+#                                  str_match(ID, "ENSMUSG(.*?)\\.(.*?)_uniqueUTR(.?)")[,3], 
+#                                  str_match(ID, "ENSMUSG(.*?)\\.(.*?)_uniqueUTR(.?)")[,4], 
+#                                  sep = "")), 
+#         tx_name = paste(str_match(ID, "(.*?)\\.(.*?)_uniqueUTR(.?)")[,2], 
+#                         "_uniqueUTR", 
+#                         str_match(ID, "(.*?)\\.(.*?)_uniqueUTR(.?)")[,4], 
+#                         sep = "")) %>% 
+#  dplyr::rename("tx_chrom" = seqnames, 
+#                "tx_strand" = strand, 
+#                "tx_start" = start, 
+#                "tx_end" = end) %>% 
+#  dplyr::select(tx_chrom, tx_start, tx_end, tx_strand, tx_id, tx_name) %>% 
+#  filter(tx_name %in% twoUTRids)
+
+#splicings <- polya_gff %>% 
+#  as_tibble() %>% 
+#  filter(type == "uniqueUTRexon") %>% 
+#  mutate(tx_id = as.integer(paste(str_match(ID, "ENSMUSG(.*?)\\.(.*?)_uniqueUTR(.?)")[,2],
+#                                  str_match(ID, "ENSMUSG(.*?)\\.(.*?)_uniqueUTR(.?)")[,3], 
+#                                  str_match(ID, "ENSMUSG(.*?)\\.(.*?)_uniqueUTR(.?)")[,4], 
+#                                  sep = "")), 
+#         tx_name = paste(str_match(ID, "(.*?)\\.(.*?)_uniqueUTR(.?)")[,2], 
+#                         "_uniqueUTR", 
+#                         str_match(ID, "(.*?)\\.(.*?)_uniqueUTR(.?)")[,4],
+#                         sep = ""),
+#         exon_rank = as.integer(str_match(ID, "ENSMUSG(.*?)\\.(.*?)_uniqueUTR(.?)_exon(.*)")[,5])) %>% 
+#  dplyr::rename("exon_start" = start, 
+#                "exon_end" = end)  %>% 
+#  filter(tx_name %in% twoUTRids) %>% 
+#  dplyr::select(exon_start, exon_end, tx_id, exon_rank)
+
+#genes <- polya_gff %>%
+#  as_tibble() %>% 
+#  filter(type == "uniqueUTR") %>%
+#  mutate(gene_id = substr(ID, 1, 18), 
+#         tx_name = paste(str_match(ID, "(.*?)\\.(.*?)_uniqueUTR(.?)")[,2],
+#                         "_uniqueUTR", 
+#                         str_match(ID, "(.*?)\\.(.*?)_uniqueUTR(.?)")[,4], 
+#                         sep = "")) %>% 
+#  dplyr::select(tx_name, gene_id) %>% 
+#  filter(tx_name %in% twoUTRids)
+
+##Make the actual TxDb object
+#polya_gff_txdb <- makeTxDb(transcripts, splicings, genes)
+
+#saveDb(polya_gff_txdb, file="twoUTR_polya_mm_gff_txdb.sqlite")
+```
+
+```{r, figure plots for MT}
+all_cor %>% 
+  mutate(selected = ifelse(ensembl_gene_id %in% substr(names(pos_prox), 1, 15), "Pos", 
+                           ifelse(ensembl_gene_id %in% substr(names(neg_prox), 1, 15), "Neg",
+                                  ifelse(ensembl_gene_id %in% substr(names(ctrl_prox), 1, 15), "Ctrl", "")))) %>%
+  filter(selected != "") %>% 
+  ggplot(aes(x = selected, y = cor, fill = selected)) + 
+  geom_violin() +
+  geom_boxplot(width = 0.15, outlier.alpha = FALSE, notch = TRUE) +
+  theme_cowplot() + 
+  guides(fill = FALSE) +
+  labs(x = "",y = "Differential expression\nand APA correlation (ρ)") +
+  scale_fill_manual(values = c("#cfd0e4", "#57b9be", "#e0a6f2")) +
+  scale_x_discrete(limits = c("Neg", "Ctrl", "Pos"), labels = c("Negatively\nCorrelated", "Control\nGenes", "Positively\nCorrelated")) +
+  coord_cartesian(ylim = c(-1,1))
+
+pos_length %>% 
+    dplyr::rename("Positively Correlated" = length) %>% 
+    full_join(., neg_length) %>% 
+    dplyr::rename("Negatively Correlated" = length) %>% 
+    full_join(., ctrl_length) %>% 
+    dplyr::rename("Control Genes" = length) %>% 
+    gather(-gene, - UTR, key = group, value = length) %>% 
+    filter(UTR == "dist") %>% 
+    ggplot(aes(x = group, y = length, fill = group)) +
+    geom_violin() + 
+    geom_boxplot(width = 0.15, outlier.alpha = FALSE, notch = TRUE) + 
+    theme_cowplot() +
+    EnvStats::stat_n_text(y.pos = -400, size = 6) +
+    coord_cartesian(ylim = c(-500, 7500)) + 
+    stat_compare_means(comparisons = comp, method = "wilcox.test", label.y = c(6500, 5750)) +
+    guides(fill = FALSE) +
+    labs(x = "", y = "Distal UTR lengths") +
+    scale_fill_manual(values = c("#cfd0e4", "#57b9be", "#e0a6f2"))  +
+  theme(strip.background = element_rect(color = "white", fill = "white"),
+        strip.text.x = element_text(size = 12, color = "Black", face = "bold")) +
+    scale_x_discrete(limits = c("Negatively Correlated", "Control Genes", "Positively Correlated"), labels = c("Negatively\nCorrelated", "Control\nGenes", "Positively\nCorrelated"))
+
+pos_GC %>% dplyr::rename("Positively Correlated" = GC) %>% 
+  full_join(., neg_GC) %>% 
+  dplyr::rename("Negatively Correlated" = GC) %>%
+  full_join(., ctrl_GC) %>% 
+  dplyr::rename("Control Genes" = GC) %>%
+  gather(-gene, -UTR, key = group, value = GC) %>%  
+  filter(UTR == "dist") %>% 
+  ggplot(aes(x = group, y = GC, fill = group)) + 
+  geom_violin() + 
+  geom_boxplot(width = 0.15, outlier.alpha = FALSE, notch = TRUE) + 
+  theme_cowplot() + 
+  stat_compare_means(comparisons = comp, method = "wilcox.test", label.y = c(0.7, 0.75)) + 
+  guides(fill = FALSE) +
+  labs(x = "", y = "Distal UTR GC content") +
+  EnvStats::stat_n_text(y.pos = 0.1, size = 6)  +
+  scale_fill_manual(values = c("#cfd0e4", "#57b9be", "#e0a6f2")) +
+  scale_x_discrete(limits = c("Negatively Correlated", "Control Genes", "Positively Correlated"), labels = c("Negatively\nCorrelated", "Control\nGenes", "Positively\nCorrelated")) +
+  coord_cartesian(ylim = c(0.10,0.75))
+
+AREScore %>% ggplot(aes(x = factor(grp), y = Score, fill = grp)) +
+  geom_violin() + 
+  geom_boxplot(width = 0.05, outlier.alpha = FALSE, notch = TRUE) + 
+  theme_cowplot() +
+  labs(x = "", y = "Distal UTR AREScore") +
+  scale_fill_manual(values = c("#cfd0e4", "#57b9be", "#e0a6f2")) +
+  scale_x_discrete(limits = c("Negatively Correlated", "Control Genes", "Positively Correlated"), labels = c("Negatively\nCorrelated", "Control\nGenes", "Positively\nCorrelated")) + 
+  stat_compare_means(comparisons = comp, method = "wilcox.test", label.y = c(10,13)) +
+  guides(fill = FALSE) +
+  EnvStats::stat_n_text(y.pos = -0.75, size = 6) +
+  coord_cartesian(ylim = c(-1,15))
+
+```
+

@@ -1,0 +1,280 @@
+---
+title: "moreTCGAsurvival"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(survival)
+library(survminer)
+library(cgdsr)
+```
+
+##More Survival analysis of TCGA samples
+This time we have more samples. We will extrapolate information from the Tumor/healthy tissue matched samples (we can caluculate delta psis) to samples which are not matched. 
+Matt gave me a list of significant delta psis in the direction that a cancer globally leans (each cancer can either lean positive or negative globally). These genes and their average (?) deltapsi are in "leaningdpsis".
+
+```{r, read in data}
+##delta psis are Tumor - Normal
+leaningdpsis <- as_tibble(read.table("data/TCGApsis/leaningdpsis.txt", header = TRUE))
+
+BLCA_psis <- as_tibble(read.table("data/TCGApsis/LABRAT.BLCA.psis", header = TRUE)) %>% gather(-Gene, -genetype, key = patient, value = psi) %>% na.omit() %>% mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1])))
+BRCA_psis <- as_tibble(read.table("data/TCGApsis/LABRAT.BRCA.psis", header = TRUE)) %>% gather(-Gene, -genetype, key = patient, value = psi) %>% na.omit() %>% mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1])))
+COAD_psis <- as_tibble(read.table("data/TCGApsis/LABRAT.COAD.psis", header = TRUE)) %>% gather(-Gene, -genetype, key = patient, value = psi) %>% na.omit() %>% mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1])))
+HNSC_psis <- as_tibble(read.table("data/TCGApsis/LABRAT.HNSC.psis", header = TRUE)) %>% gather(-Gene, -genetype, key = patient, value = psi) %>% na.omit() %>% mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1])))
+KIRC_psis <- as_tibble(read.table("data/TCGApsis/LABRAT.KIRC.psis", header = TRUE)) %>% gather(-Gene, -genetype, key = patient, value = psi) %>% na.omit() %>% mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1])))
+KIRP_psis <- as_tibble(read.table("data/TCGApsis/LABRAT.KIRP.psis", header = TRUE)) %>% gather(-Gene, -genetype, key = patient, value = psi) %>% na.omit() %>% mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1])))
+LIHC_psis <- as_tibble(read.table("data/TCGApsis/LABRAT.LIHC.psis", header = TRUE)) %>% gather(-Gene, -genetype, key = patient, value = psi) %>% na.omit() %>% mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1])))
+LUAD_psis <- as_tibble(read.table("data/TCGApsis/LABRAT.LUAD.psis", header = TRUE)) %>% gather(-Gene, -genetype, key = patient, value = psi) %>% na.omit() %>% mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1])))
+LUSC_psis <- as_tibble(read.table("data/TCGApsis/LABRAT.LUSC.psis", header = TRUE)) %>% gather(-Gene, -genetype, key = patient, value = psi) %>% na.omit() %>% mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1])))
+PCPG_psis <- as_tibble(read.table("data/TCGApsis/LABRAT.PCPG.psis", header = TRUE)) %>% gather(-Gene, -genetype, key = patient, value = psi) %>% na.omit() %>% mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1])))
+PRAD_psis <- as_tibble(read.table("data/TCGApsis/LABRAT.PRAD.psis", header = TRUE)) %>% gather(-Gene, -genetype, key = patient, value = psi) %>% na.omit() %>% mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1])))
+STAD_psis <- as_tibble(read.table("data/TCGApsis/LABRAT.STAD.psis", header = TRUE)) %>% gather(-Gene, -genetype, key = patient, value = psi) %>% na.omit() %>% mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1])))
+THCA_psis <- as_tibble(read.table("data/TCGApsis/LABRAT.THCA.psis", header = TRUE)) %>% gather(-Gene, -genetype, key = patient, value = psi) %>% na.omit() %>% mutate(Gene = unlist(lapply(Gene, function(x) unlist(str_split(x, "[.]"))[1])))
+
+#psi_list <- list(BLCA_psis, BRCA_psis, COAD_psis, HNSC_psis, KIRC_psis, KIRP_psis, LIHC_psis, LUAD_psis, LUSC_psis, PRAD_psis, STAD_psis, THCA_psis)
+#names(psi_list) <- c('BLCA', 'BRCA', 'COAD', 'HNSC', 'KIRC', 'KIRP', 'LIHC', 'LUAD', 'LUSC', 'PRAD', 'STAD', 'THCA')
+
+#TCGA_psis <- bind_rows(psi_list, .id = "cancer")
+
+#old m_dat from Austin:
+#m_dat <- as_tibble(read.csv("data/TCGApsis/tcga_clinical_meta.tsv", header = TRUE, sep = "\t")) %>% 
+#  mutate(patient = str_replace_all(Case_ID, pattern = "-", replace = "."))
+
+cancernames <- c('BLCA', 'BRCA', 'COAD', 'HNSC', 'KIRC', 'KIRP', 'LIHC', 'LUAD', 'LUSC', 'PRAD', 'STAD', 'THCA')
+case_list <- c("blca_tcga_all", "brca_tcga_all", "coadread_tcga_all", "hnsc_tcga_all", "kirc_tcga_all", "kirp_tcga_all", "lihc_tcga_all", "luad_tcga_all", "lusc_tcga_all", "prad_tcga_all", "stad_tcga_all", "thca_tcga_all")
+
+#####PCPG DOESNT HAVE OS MONTHS?????
+
+
+mycgds = CGDS("https://www.cbioportal.org/")
+
+x <- 1:12
+CD <- lapply(x, function(x) select(as_tibble(getClinicalData(mycgds, case_list[x]),rownames="patient"),patient,OS_MONTHS,OS_STATUS))
+
+m_dat <- CD %>%
+  bind_rows() %>% 
+  mutate(patient = substr(patient,0,nchar(patient)-3),
+         OS_STATUS = as.numeric(substr(OS_STATUS, 0,1)))
+
+
+LUSC_leandir <- "negative"
+BLCA_leandir <- "negative"
+LUAD_leandir <- "negative"
+HNSC_leandir <- "negative"
+LIHC_leandir <- "negative"
+BRCA_leandir <- "negative"
+COAD_leandir <- "negative"
+PRAD_leandir <- "negative"
+KIRP_leandir <- "positive"
+THYM_leandir <- "positive"
+PCPG_leandir <- "positive"
+THCA_leandir <- "positive"
+KIRC_leandir <- "positive"
+STAD_leandir <- "positive"
+
+```
+
+##categorize patients for each cancer type
+patients will be categorized as extremely affected or not via their psi values for the genes of interest. 
+Considering only psi values for the genes of interest, median or mean psis are calculated for each patient.
+These values are then ordered from low to high and patients are split into extreme halves, thirds or quartiles.
+
+
+```{r, plot_fx, fig.height=7, warning=FALSE}
+#old m_dat fx
+cancer_surv_plot <- function(cancer, rank_value, group, title){
+  
+  cancer_psis <- eval(parse(text = paste(cancer,"_psis", sep = "")))
+  
+  cancer_genes <- leaningdpsis %>% filter(tumor == cancer) %>% pull(Gene)
+  cancer_ranks <- cancer_psis %>% 
+    filter(Gene %in% cancer_genes) %>% 
+    group_by(patient) %>% 
+    summarize(n=n(), 
+              mean_psi = mean(psi, na.rm = TRUE),
+              med_psi = median(psi, na.rm = TRUE),
+              short = length(which(psi < 0.5)) / n * 100,
+              long = length(which(psi > 0.5)) / n * 100, .groups = "rowwise") %>% 
+    filter(n > 0.75*length(cancer_genes))  %>% 
+    left_join(., dplyr::select(m_dat, patient, vital_status, days_to_death)) %>%
+    mutate(days = ifelse(days_to_death == "'--", NA, as.numeric(days_to_death)),
+           event = ifelse(vital_status == "Alive", 1, ifelse(vital_status == "Dead", 2, 3))) %>% 
+    filter(event != 3) %>% #this excludes events that are "Not Reported"
+    arrange(eval(parse(text = rank_value))) %>% 
+    ungroup() %>% 
+    mutate(rank = c(1:nrow(.)),
+           halfs = ifelse(rank > round(nrow(.)/2), "high", "low"),
+           thirds = ifelse(rank < round(nrow(.)/3), "low", ifelse(rank > round(nrow(.)*(2/3)), "high", "middle")),
+           ExtQs = ifelse(rank < round(nrow(.)/4), "low", ifelse(rank > round(nrow(.)*(3/4)), "high", "middle"))) %>% 
+    filter(eval(parse(text = group) != "middle"))
+  
+  sfit2 <- surv_fit(Surv(cancer_ranks$days, cancer_ranks$event)~eval(parse(text = group)), data = cancer_ranks)
+  ggsurvplot(sfit2, pval = TRUE, pval.method = TRUE, risk.table = TRUE, legend.labs = substr(names(sfit2$strata),27,nchar(names(sfit2$strata)))) + labs(title = paste(cancer, rank_value, "by", group, sep = " "), subtitle = paste("Deltapsis lean", eval(parse(text = paste(cancer,"_leandir", sep = ""))), sep = " "))
+  
+}
+
+#cgdsr m_dat fx
+cancer_surv_plot <- function(cancer, rank_value, group){
+  
+  cancer_psis <- eval(parse(text = paste(cancer,"_psis", sep = "")))
+  
+  cancer_genes <- leaningdpsis %>% filter(tumor == cancer) %>% pull(Gene)
+  cancer_ranks <- cancer_psis %>% 
+    filter(Gene %in% cancer_genes) %>% 
+    group_by(patient) %>% 
+    summarize(n=n(), 
+              mean_psi = mean(psi, na.rm = TRUE),
+              med_psi = median(psi, na.rm = TRUE), .groups = "rowwise") %>% 
+    filter(n > 0.75*length(cancer_genes)) %>% 
+    left_join(., m_dat) %>% 
+    na.omit() %>% 
+    arrange(eval(parse(text = rank_value))) %>% 
+    ungroup() %>% 
+    mutate(rank = c(1:nrow(.)),
+           halfs = ifelse(rank > round(nrow(.)/2), "high", "low"),
+           thirds = ifelse(rank < round(nrow(.)/3), "low", ifelse(rank > round(nrow(.)*(2/3)), "high", "middle")),
+           ExtQs = ifelse(rank < round(nrow(.)/4), "low", ifelse(rank > round(nrow(.)*(3/4)), "high", "middle"))) %>% 
+    filter(eval(parse(text = group)) != "middle")
+  
+  sfit2 <- surv_fit(Surv(cancer_ranks$OS_MONTHS, cancer_ranks$OS_STATUS)~eval(parse(text = group)), data = cancer_ranks)
+  
+  ggsurvplot(sfit2, pval = TRUE, 
+             pval.method = TRUE, 
+             risk.table = "nrisk_cumcensor",
+             legend.title = "Psi",
+             legend.labs = substr(names(sfit2$strata), 27, nchar(names(sfit2$strata))),
+             xlab = "Months",
+             title = paste(cancer, rank_value, "by", group, "\n", "Deltapsis lean", eval(parse(text = paste(cancer,"_leandir", sep = ""))), sep = " "))
+  
+}
+
+```
+
+##Expectations
+Cancer types that have delta psis that lean Negative (more commmon) are expected to have worse outcome when psis are LOW
+Negative == High psis on top, low psis bottom left
+
+Cancer types that have delta psis that lean Positive are expected to have worse outcome when psis are HIGH
+Positive == Low psis on top, high psis bottom left
+
+##Median Psi Values in extreme upper and lower quartilies
+
+```{r, med_psi_qs, fig.height=7, warning=FALSE}
+lapply(x, function(x) cancer_surv_plot(cancernames[x], "med_psi", "ExtQs"))
+
+```
+
+```{r, pretty plots}
+HNSC_genes <- leaningdpsis %>% filter(tumor == "HNSC") %>% pull(Gene)
+
+  HNSC_ranks <- HNSC_psis %>% 
+    filter(Gene %in% HNSC_genes) %>% 
+    group_by(patient) %>% 
+    summarize(n=n(), 
+              med_psi = median(psi, na.rm = TRUE), .groups = "rowwise") %>% 
+    filter(n > 0.75*length(HNSC_genes)) %>% 
+    left_join(., m_dat) %>% 
+    na.omit() %>% 
+    arrange(med_psi) %>% 
+    ungroup() %>% 
+    mutate(rank = c(1:nrow(.)),
+           ExtQs = ifelse(rank <= round(nrow(.)/4), "low", ifelse(rank > round(nrow(.)*(3/4)), "high", "middle"))) %>% 
+    filter(ExtQs != "middle")
+  
+  sfit_HNSC <- surv_fit(Surv(HNSC_ranks$OS_MONTHS, HNSC_ranks$OS_STATUS)~ExtQs, data = HNSC_ranks)
+  
+ggsurvplot(sfit_HNSC, 
+             pval = TRUE, 
+             pval.method = TRUE, 
+             palette = c("#FCA285", "#85BCDB"),
+             size = 1.5,
+             censor.shape = 124,
+             legend.title = "median psi",
+             legend.labs = paste(substr(names(sfit_HNSC$strata), 7, nchar(names(sfit_HNSC$strata))), " (N=", sfit_HNSC$n, ")", sep = ""),
+             font.legend = 16,
+             xlab = "Time (Months)",
+             title = paste("HNSC", sep = " "),
+             font.main = 20,
+             xlim = c(0,80),
+             break.time.by = 20,
+             ylim = c(0.3,1),
+             pval.coord = c(0, 0.53),
+             pval.method.coord = c(0, 0.6)) 
+  
+  
+  
+  
+  
+  KIRC_genes <- leaningdpsis %>% filter(tumor == "KIRC") %>% pull(Gene)
+
+  KIRC_ranks <- KIRC_psis %>% 
+    filter(Gene %in% KIRC_genes) %>% 
+    group_by(patient) %>% 
+    summarize(n=n(), 
+              med_psi = median(psi, na.rm = TRUE), .groups = "rowwise") %>% 
+    filter(n > 0.75*length(KIRC_genes)) %>% 
+    left_join(., m_dat) %>% 
+    na.omit() %>% 
+    arrange(med_psi) %>% 
+    ungroup() %>% 
+    mutate(rank = c(1:nrow(.)),
+           ExtQs = ifelse(rank <= round(nrow(.)/4), "low", ifelse(rank > round(nrow(.)*(3/4)), "high", "middle"))) %>% 
+    filter(ExtQs != "middle")
+  
+  sfit_KIRC <- surv_fit(Surv(KIRC_ranks$OS_MONTHS, KIRC_ranks$OS_STATUS)~ExtQs, data = KIRC_ranks)
+  
+  ggsurvplot(sfit_KIRC, 
+             pval = TRUE, 
+             pval.method = TRUE, 
+             palette = c("#FCA285", "#85BCDB"),
+             size = 1.5,
+             censor.shape = 124,
+             legend.title = "median psi",
+             legend.labs = paste(substr(names(sfit_KIRC$strata), 7, nchar(names(sfit_KIRC$strata))), " (N=", sfit_KIRC$n, ")", sep = ""),
+             font.legend = 16,
+             xlab = "Time (Months)",
+             title = paste("KIRC", sep = " "),
+             font.main = 20,
+             xlim = c(0,100),
+             break.time.by = 25,
+             ylim = c(0.3,1),
+             pval.coord = c(0, 0.58),
+             pval.method.coord = c(0, 0.65))
+```
+
+##Mean Psi Values in extreme upper and lower quartiles
+
+```{r, mean_psi_qs, fig.height=7, warning=FALSE}
+lapply(x, function(x) cancer_surv_plot(cancernames[x], "mean_psi", "ExtQs"))
+
+```
+
+##Median Psi Values in upper and lower halves
+
+```{r, med_psi_halves, fig.height=7, warning=FALSE}
+lapply(x, function(x) cancer_surv_plot(cancernames[x], "med_psi", "halfs"))
+
+```
+
+##Mean psi values by upper and lower halves
+
+```{r, mean_psi_halves, fig.height=7, warning=FALSE}
+lapply(x, function(x) cancer_surv_plot(cancernames[x], "mean_psi", "halfs"))
+
+```
+
+##Median psi values by upper and lower thirds
+
+```{r, med_psi_thirds, fig.height=7, warning=FALSE}
+lapply(x, function(x) cancer_surv_plot(cancernames[x], "med_psi", "thirds"))
+
+```
+
+##Mean Psi Values in extreme upper and lower thirds
+
+```{r, mean_psi_thirds, fig.height=7, warning=FALSE}
+lapply(x, function(x) cancer_surv_plot(cancernames[x], "mean_psi", "thirds"))
+
+```
